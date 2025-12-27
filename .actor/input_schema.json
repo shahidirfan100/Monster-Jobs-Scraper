@@ -34,6 +34,14 @@
             "minimum": 0,
             "maximum": 10000
         },
+        "maxPages": {
+            "title": "Maximum Pages",
+            "type": "integer",
+            "description": "Maximum number of result pages to fetch across HTTP/Browser (0 = unlimited). Lower values keep runs fast and cheap.",
+            "default": 3,
+            "minimum": 0,
+            "maximum": 30
+        },
         "sortBy": {
             "title": "Sort By",
             "type": "string",
@@ -56,9 +64,13 @@
             "default": {
                 "useApifyProxy": true
             }
+        },
+        "httpOnly": {
+            "title": "HTTP Only (Skip Browser)",
+            "type": "boolean",
+            "description": "Use only HTTP (JSON/HTML) strategies and skip Playwright/Camoufox fallback for faster and cheaper runs.",
+            "default": false
         }
     },
-    "required": [
-        "searchQuery"
-    ]
+    "required": []
 }

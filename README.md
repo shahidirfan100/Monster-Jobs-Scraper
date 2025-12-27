@@ -71,6 +71,8 @@ Help job seekers by analyzing market demand, required skills, and location-based
 
 ### Required Parameters
 
+Provide either a `searchUrl` or a `searchQuery` (location optional). If you pass a `searchUrl`, other search params are ignored.
+
 <table>
 <tr>
 <td><strong>Parameter</strong></td>
@@ -79,7 +81,7 @@ Help job seekers by analyzing market demand, required skills, and location-based
 </tr>
 <tr>
 <td><code>searchQuery</code></td>
-<td>Job title or keywords to search for</td>
+<td>Job title or keywords to search for (used when <code>searchUrl</code> is not provided)</td>
 <td>admin, software engineer, data analyst</td>
 </tr>
 </table>
@@ -106,6 +108,16 @@ Help job seekers by analyzing market demand, required skills, and location-based
 <td><code>maxJobs</code></td>
 <td>Maximum number of jobs to extract (0 = unlimited)</td>
 <td>20</td>
+</tr>
+<tr>
+<td><code>maxPages</code></td>
+<td>Maximum number of result pages to fetch (0 = unlimited)</td>
+<td>3</td>
+</tr>
+<tr>
+<td><code>httpOnly</code></td>
+<td>Skip Playwright fallback and use only HTTP (faster/cheaper)</td>
+<td>false</td>
 </tr>
 <tr>
 <td><code>sortBy</code></td>

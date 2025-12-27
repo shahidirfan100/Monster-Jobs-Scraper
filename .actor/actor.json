@@ -10,7 +10,7 @@
     ],
     "meta": {
         "templateId": "monster-jobs-scraper",
-        "generatedBy": "Claude Sonnet 4.5"
+        "generatedBy": "GPT-5 (Codex)"
     },
     "input": "./input_schema.json",
     "output": "./output_schema.json",

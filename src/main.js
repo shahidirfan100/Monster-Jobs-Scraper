@@ -126,6 +126,136 @@ function stripHtml(html) {
 }
 
 /**
+ * Normalize Monster job object variants into our unified format
+ */
+function normalizeMonsterJob(job) {
+    const jobUrl = job.jobUrl || job.url || job.applyUrl ||
+        job.jobViewUrl || job.detailUrl ||
+        (job.jobId ? `https://www.monster.com/job-openings/${job.jobId}` : '');
+
+    let location = job.location || job.jobLocation || job.city || job.state || '';
+    if (typeof location === 'object' && location !== null) {
+        location = [location.city, location.state || location.stateProvince, location.country].filter(Boolean).join(', ');
+    }
+
+    const description = job.description || job.jobDescription || job.snippet || job.text || '';
+
+    return {
+        title: job.title || job.jobTitle || job.name || '',
+        company: job.company || job.companyName || job.hiringCompany || job.companyDisplayName || '',
+        location,
+        salary: job.salary || job.compensation || job.estimatedSalary || job.pay || 'Not specified',
+        jobType: job.jobType || job.employmentType || job.type || 'Not specified',
+        postedDate: job.postedDate || job.datePosted || job.listedDate || job.postedAt || '',
+        descriptionHtml: description,
+        descriptionText: stripHtml(description),
+        url: jobUrl,
+        scrapedAt: new Date().toISOString()
+    };
+}
+
+/**
+ * Extract job arrays from common Monster/Next.js data structures
+ */
+function extractJobsFromDataObject(data) {
+    const jobCollections = [
+        data?.props?.pageProps?.searchResults?.jobs,
+        data?.props?.pageProps?.searchResults?.docs,
+        data?.props?.pageProps?.jobs,
+        data?.props?.pageProps?.initialJobs,
+        data?.jobResults,
+        data?.searchResults?.docs,
+        data?.searchResults?.results,
+        data?.data?.jobs,
+        data?.docs,
+        data?.results,
+    ];
+
+    let jobArray = jobCollections.find(arr => Array.isArray(arr) && arr.length > 0);
+    if (!jobArray && Array.isArray(data)) jobArray = data;
+    if (!jobArray && data?.itemListElement && Array.isArray(data.itemListElement)) {
+        jobArray = data.itemListElement.map(item => item.item || item).filter(Boolean);
+    }
+
+    if (!jobArray || !Array.isArray(jobArray)) return [];
+    return jobArray.map(normalizeMonsterJob);
+}
+
+/**
+ * Extract jobs from __NEXT_DATA__ or embedded JSON in static HTML
+ */
+function extractJobsFromNextDataHtml(html) {
+    const $ = cheerio.load(html);
+    const nextScript = $('#__NEXT_DATA__').html() || $('script[id="__NEXT_DATA__"]').html();
+    if (!nextScript) {
+        // Look for inline initial state blobs
+        const inlineScripts = $('script:not([src])').map((_, el) => $(el).text()).get();
+        for (const scriptContent of inlineScripts) {
+            const matches = scriptContent.match(/__INITIAL_STATE__\s*=\s*(\{.*?\});/s) ||
+                scriptContent.match(/window\\.APP_DATA\\s*=\\s*(\\{.*?\\});/s);
+            if (matches && matches[1]) {
+                try {
+                    const data = JSON.parse(matches[1]);
+                    const jobs = extractJobsFromDataObject(data);
+                    if (jobs.length) return { jobs, source: '__INITIAL_STATE__' };
+                } catch (err) {
+                    log.debug(`Failed to parse inline state JSON: ${err.message}`);
+                }
+            }
+        }
+        return { jobs: [], source: null };
+    }
+
+    try {
+        const data = JSON.parse(nextScript);
+        const jobs = extractJobsFromDataObject(data);
+        return { jobs, source: '__NEXT_DATA__' };
+    } catch (err) {
+        log.debug(`Failed to parse __NEXT_DATA__: ${err.message}`);
+        return { jobs: [], source: null };
+    }
+}
+
+/**
+ * Extract jobs from JSON-LD inside static HTML
+ */
+function extractJobsFromJsonLdHtml(html) {
+    const $ = cheerio.load(html);
+    const scripts = $('script[type="application/ld+json"]')
+        .map((_, el) => $(el).text())
+        .get();
+
+    const jobs = [];
+
+    for (const content of scripts) {
+        try {
+            const data = JSON.parse(content);
+            const parsed = extractJobsFromDataObject(data);
+            if (parsed.length) {
+                jobs.push(...parsed);
+                continue;
+            }
+
+            if (Array.isArray(data)) {
+                for (const item of data) {
+                    if (item['@type'] === 'JobPosting') jobs.push(parseJobPosting(item));
+                }
+            } else if (data['@type'] === 'JobPosting') {
+                jobs.push(parseJobPosting(data));
+            } else if (data['@graph']) {
+                for (const item of data['@graph']) {
+                    if (item['@type'] === 'JobPosting') jobs.push(parseJobPosting(item));
+                }
+            }
+        } catch (err) {
+            log.debug(`Failed to parse JSON-LD in HTML: ${err.message}`);
+        }
+    }
+
+    return jobs;
+}
+
+/**
  * Intercept and capture Monster.com API requests for job data
  * This is the PRIMARY and FASTEST method
  */
@@ -313,28 +443,7 @@ async function extractJobsViaMonsterAPI(page) {
                 log.info(`Found ${jobArray.length} jobs in embedded API data`);
 
                 for (const job of jobArray) {
-                    const jobUrl = job.jobUrl || job.url || job.applyUrl || 
-                                  job.jobViewUrl || job.detailUrl ||
-                                  (job.jobId ? `https://www.monster.com/job-openings/${job.jobId}` : '');
-
-                    // Extract location from various formats
-                    let location = job.location || job.jobLocation || job.city || '';
-                    if (typeof location === 'object') {
-                        location = [location.city, location.state, location.country].filter(Boolean).join(', ');
-                    }
-
-                    jobs.push({
-                        title: job.title || job.jobTitle || job.name || '',
-                        company: job.company || job.companyName || job.hiringCompany || job.companyDisplayName || '',
-                        location,
-                        salary: job.salary || job.compensation || job.estimatedSalary || 'Not specified',
-                        jobType: job.jobType || job.employmentType || job.type || 'Not specified',
-                        postedDate: job.postedDate || job.datePosted || job.listedDate || job.postedAt || '',
-                        descriptionHtml: job.description || job.jobDescription || job.snippet || '',
-                        descriptionText: stripHtml(job.description || job.jobDescription || job.snippet || ''),
-                        url: jobUrl,
-                        scrapedAt: new Date().toISOString()
-                    });
+                    jobs.push(normalizeMonsterJob(job));
                 }
             }
         } catch (parseErr) {
@@ -357,15 +466,29 @@ async function extractJobsViaMonsterAPI(page) {
  * Fetch complete job description from detail page using got-scraping
  * Uses cookies from Camoufox session to maintain Cloudflare bypass
  */
-async function fetchFullDescription(jobUrl, cookies = '', userAgent = '') {
+async function fetchFullDescription(jobUrl, options = {}) {
+    const {
+        cookies = '',
+        userAgent = '',
+        proxyUrl,
+    } = options;
+
     try {
         const response = await gotScraping({
             url: jobUrl,
+            proxyUrl,
+            useHeaderGenerator: true,
+            headerGeneratorOptions: {
+                browsers: ['firefox', 'chrome'],
+                devices: ['desktop'],
+                operatingSystems: ['windows', 'macos'],
+                locales: ['en-US', 'en'],
+            },
             headers: {
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
-                'Cookie': cookies,
-                'User-Agent': userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+                ...(cookies ? { Cookie: cookies } : {}),
+                ...(userAgent ? { 'User-Agent': userAgent } : {}),
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
                 'Sec-Fetch-Site': 'same-origin',
@@ -442,16 +565,31 @@ async function fetchFullDescription(jobUrl, cookies = '', userAgent = '') {
 /**
  * Enrich jobs with full descriptions from detail pages
  */
-async function enrichJobsWithFullDescriptions(jobs, page, maxConcurrency = 10) {
+async function enrichJobsWithFullDescriptions(jobs, options = {}) {
+    const {
+        page = null,
+        proxyConfiguration = null,
+        maxConcurrency = 5,
+    } = options;
+
     if (jobs.length === 0) return jobs;
 
     log.info(`Fetching full descriptions for ${jobs.length} jobs...`);
 
-    const cookies = await page.context().cookies();
-    const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-    const userAgent = await page.evaluate(() => navigator.userAgent);
+    let cookieString = '';
+    let userAgent = '';
+    let proxyUrl = null;
 
-    log.debug(`Using ${cookies.length} cookies from Camoufox session for detail pages`);
+    if (page) {
+        const cookies = await page.context().cookies();
+        cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        userAgent = await page.evaluate(() => navigator.userAgent);
+        log.debug(`Using ${cookies.length} cookies from Camoufox session for detail pages`);
+    }
+
+    if (!proxyUrl && proxyConfiguration) {
+        proxyUrl = await proxyConfiguration.newUrl();
+    }
 
     const enrichedJobs = [];
     const batchSize = maxConcurrency;
@@ -463,7 +601,11 @@ async function enrichJobsWithFullDescriptions(jobs, page, maxConcurrency = 10) {
         const batchPromises = batch.map(async (job) => {
             if (!job.url) return job;
 
-            const fullDesc = await fetchFullDescription(job.url, cookieString, userAgent);
+            const fullDesc = await fetchFullDescription(job.url, {
+                cookies: cookieString,
+                userAgent,
+                proxyUrl,
+            });
 
             if (fullDesc && fullDesc.blocked) {
                 blockedCount++;
@@ -538,99 +680,221 @@ function buildSearchUrl(input) {
  * Updated with comprehensive Monster.com selectors
  */
 async function extractJobDataViaHTML(page) {
-    log.info('Extracting job data via HTML parsing with Cheerio');
+    log.info('Extracting job data via HTML parsing with Cheerio (Playwright)');
 
     try {
         const html = await page.content();
         const $ = cheerio.load(html);
-        const jobs = [];
-
-        // Monster.com job card selectors - UPDATED for current structure
-        const jobCardSelectors = [
-            'div[data-test-id="svx-job-card"]',          // Current Monster structure
-            'div[data-testid="job-card"]',
-            'div.job-card-container',
-            'div.job-listing',
-            'article.job-card',
-            '[data-test-id*="job"]',
-            '[class*="JobCard"]',
-            'div[id*="job-"]',
-            'section[class*="job"]'
-        ];
-
-        let jobElements = $([]);
-        let selectorUsed = '';
-
-        for (const selector of jobCardSelectors) {
-            const elements = $(selector);
-            if (elements.length > 0) {
-                log.info(`Found ${elements.length} job cards with selector: ${selector}`);
-                jobElements = elements;
-                selectorUsed = selector;
-                break;
-            }
-        }
-
-        if (jobElements.length === 0) {
-            log.warning('No job cards found with any selector. Trying fallback extraction...');
-            
-            // Fallback: look for links with job-related URLs
-            const jobLinks = $('a[href*="/job-openings/"], a[href*="/job/"], a[href*="jobid="]');
-            if (jobLinks.length > 0) {
-                log.info(`Found ${jobLinks.length} job links via fallback method`);
-                
-                jobLinks.each((_, el) => {
-                    const $link = $(el);
-                    const href = $link.attr('href');
-                    const title = $link.text().trim();
-                    
-                    if (title && title.length > 5) {
-                        let fullUrl = href;
-                        if (href && !href.startsWith('http')) {
-                            fullUrl = `https://www.monster.com${href}`;
-                        }
-                        
-                        // Try to find company and location in parent elements
-                        const $parent = $link.closest('div, article, section');
-                        const company = $parent.find('[class*="company"], [class*="Company"]').first().text().trim();
-                        const location = $parent.find('[class*="location"], [class*="Location"]').first().text().trim();
-                        
-                        jobs.push({
-                            title,
-                            company: company || '',
-                            location: location || '',
-                            salary: 'Not specified',
-                            jobType: 'Not specified',
-                            postedDate: '',
-                            descriptionHtml: '',
-                            descriptionText: '',
-                            url: fullUrl,
-                            scrapedAt: new Date().toISOString()
-                        });
-                    }
-                });
-                
-                log.info(`Extracted ${jobs.length} jobs via fallback link extraction`);
-                return jobs;
-            }
-            
-            return [];
-        }
-
-        log.info(`Processing ${jobElements.length} job cards with selector: ${selectorUsed}`);
-
-        jobElements.each((_, element) => {
-            const job = extractJobFromElement($, $(element));
-            if (job) jobs.push(job);
-        });
-
-        log.info(`Extracted ${jobs.length} jobs via HTML parsing`);
-        return jobs;
-
+        return extractJobsFromCheerioDocument($, 'Playwright HTML parsing');
     } catch (error) {
         log.warning(`HTML parsing failed: ${error.message}`);
         return [];
     }
+}
+
+/**
+ * Extract job data from static HTML (HTTP flow)
+ */
+function extractJobDataFromHtmlString(html) {
+    const $ = cheerio.load(html);
+    return extractJobsFromCheerioDocument($, 'HTTP HTML parsing');
+}
+
+/**
+ * Shared Cheerio-based job card extraction
+ */
+function extractJobsFromCheerioDocument($, logPrefix = 'HTML parsing') {
+    const jobs = [];
+
+    // Monster.com job card selectors - UPDATED for current structure
+    const jobCardSelectors = [
+        'div[data-test-id="svx-job-card"]',          // Current Monster structure
+        'div[data-testid="job-card"]',
+        'div.job-card-container',
+        'div.job-listing',
+        'article.job-card',
+        '[data-test-id*="job"]',
+        '[class*="JobCard"]',
+        'div[id*="job-"]',
+        'section[class*="job"]'
+    ];
+
+    let jobElements = $([]);
+    let selectorUsed = '';
+
+    for (const selector of jobCardSelectors) {
+        const elements = $(selector);
+        if (elements.length > 0) {
+            log.info(`[${logPrefix}] Found ${elements.length} job cards with selector: ${selector}`);
+            jobElements = elements;
+            selectorUsed = selector;
+            break;
+        }
+    }
+
+    if (jobElements.length === 0) {
+        log.warning(`[${logPrefix}] No job cards found with any selector. Trying fallback extraction...`);
+
+        // Fallback: look for links with job-related URLs
+        const jobLinks = $('a[href*="/job-openings/"], a[href*="/job/"], a[href*="jobid="]');
+        if (jobLinks.length > 0) {
+            log.info(`[${logPrefix}] Found ${jobLinks.length} job links via fallback method`);
+
+            jobLinks.each((_, el) => {
+                const $link = $(el);
+                const href = $link.attr('href');
+                const title = $link.text().trim();
+
+                if (title && title.length > 5) {
+                    let fullUrl = href;
+                    if (href && !href.startsWith('http')) {
+                        fullUrl = `https://www.monster.com${href}`;
+                    }
+
+                    // Try to find company and location in parent elements
+                    const $parent = $link.closest('div, article, section');
+                    const company = $parent.find('[class*="company"], [class*="Company"]').first().text().trim();
+                    const location = $parent.find('[class*="location"], [class*="Location"]').first().text().trim();
+
+                    jobs.push({
+                        title,
+                        company: company || '',
+                        location: location || '',
+                        salary: 'Not specified',
+                        jobType: 'Not specified',
+                        postedDate: '',
+                        descriptionHtml: '',
+                        descriptionText: '',
+                        url: fullUrl,
+                        scrapedAt: new Date().toISOString()
+                    });
+                }
+            });
+
+            log.info(`[${logPrefix}] Extracted ${jobs.length} jobs via fallback link extraction`);
+            return jobs;
+        }
+
+        return [];
+    }
+
+    log.info(`[${logPrefix}] Processing ${jobElements.length} job cards with selector: ${selectorUsed}`);
+
+    jobElements.each((_, element) => {
+        const job = extractJobFromElement($, $(element));
+        if (job) jobs.push(job);
+    });
+
+    log.info(`[${logPrefix}] Extracted ${jobs.length} jobs via HTML parsing`);
+    return jobs;
+}
+
+function detectCloudflareInHtml(html) {
+    if (!html) return false;
+    return /Cloudflare|Just a moment|unusual traffic|cf-browser/i.test(html);
+}
+
+/**
+ * Fetch search page HTML via fast HTTP request
+ */
+async function fetchSearchPageHtml(url, proxyConfiguration) {
+    try {
+        const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
+        const response = await gotScraping({
+            url,
+            proxyUrl,
+            useHeaderGenerator: true,
+            headerGeneratorOptions: {
+                browsers: ['firefox', 'chrome'],
+                devices: ['desktop'],
+                operatingSystems: ['windows', 'macos'],
+                locales: ['en-US', 'en'],
+            },
+            headers: {
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Upgrade-Insecure-Requests': '1',
+            },
+            timeout: { request: 15000 },
+            retry: { limit: 2 },
+        });
+
+        return { html: response.body, statusCode: response.statusCode };
+    } catch (error) {
+        log.warning(`HTTP fetch failed for ${url}: ${error.message}`);
+        return { html: '', statusCode: 0, error };
+    }
+}
+
+/**
+ * Attempt multiple extraction strategies on static HTML
+ */
+function extractJobsFromHtmlPage(html) {
+    const nextData = extractJobsFromNextDataHtml(html);
+    if (nextData.jobs.length) {
+        return { jobs: nextData.jobs, methodUsed: `HTTP ${nextData.source || 'Embedded JSON'}` };
+    }
+
+    const jsonLdJobs = extractJobsFromJsonLdHtml(html);
+    if (jsonLdJobs.length) {
+        return { jobs: jsonLdJobs, methodUsed: 'HTTP JSON-LD' };
+    }
+
+    const htmlJobs = extractJobDataFromHtmlString(html);
+    if (htmlJobs.length) {
+        return { jobs: htmlJobs, methodUsed: 'HTTP HTML parsing' };
+    }
+
+    return { jobs: [], methodUsed: null };
+}
+
+/**
+ * HTTP-first extraction loop (JSON/Next.js/HTML) with pagination
+ */
+async function extractJobsHttpFirst(searchUrl, proxyConfiguration, options = {}) {
+    const { maxJobs = 20, maxPages = 3 } = options;
+    const jobs = [];
+    let pagesProcessed = 0;
+    let method = '';
+
+    const baseUrl = new URL(searchUrl);
+    const startPage = parseInt(baseUrl.searchParams.get('page') || '1', 10);
+
+    for (let page = startPage; (maxPages === 0 || pagesProcessed < maxPages) && (maxJobs === 0 || jobs.length < maxJobs); page++) {
+        baseUrl.searchParams.set('page', page.toString());
+        const currentUrl = baseUrl.toString();
+
+        log.info(`HTTP fetch for page ${page}: ${currentUrl}`);
+        const { html, statusCode } = await fetchSearchPageHtml(currentUrl, proxyConfiguration);
+        pagesProcessed++;
+
+        if (!html) {
+            log.warning(`Empty response for page ${page} (status ${statusCode || 'unknown'})`);
+            break;
+        }
+
+        if (detectCloudflareInHtml(html)) {
+            log.warning(`Cloudflare challenge detected in HTTP response for ${currentUrl} - switching to browser fallback`);
+            return { jobs: [], pagesProcessed, method: 'HTTP blocked' };
+        }
+
+        const { jobs: pageJobs, methodUsed } = extractJobsFromHtmlPage(html);
+        if (!method && methodUsed) method = methodUsed;
+
+        if (!pageJobs.length) {
+            log.info(`No jobs found on HTTP page ${page}, stopping HTTP flow`);
+            break;
+        }
+
+        for (const job of pageJobs) {
+            if (maxJobs > 0 && jobs.length >= maxJobs) break;
+            jobs.push(job);
+        }
+
+        if (maxJobs > 0 && jobs.length >= maxJobs) break;
+    }
+
+    return { jobs, pagesProcessed, method: method || 'HTTP parsing' };
 }
 
 /**
@@ -867,9 +1131,7 @@ async function saveDebugInfo(page) {
             }
         });
 
-        log.warning('═══════════════════════════════════════════════');
-        log.warning('DEBUG: Page Structure Analysis');
-        log.warning('═══════════════════════════════════════════════');
+        log.warning('================ DEBUG: Page Structure Analysis ================');
         log.warning(`Title: ${structureAnalysis.title}`);
         log.warning(`URL: ${structureAnalysis.url}`);
         log.warning(`Has Cloudflare: ${structureAnalysis.hasCloudflare}`);
@@ -893,13 +1155,13 @@ async function saveDebugInfo(page) {
         structureAnalysis.sampleClasses.slice(0, 10).forEach(className => {
             log.warning(`  - ${className}`);
         });
-        log.warning('═══════════════════════════════════════════════');
+        log.warning('==============================================================');
 
         // Save full HTML and analysis
         await Actor.setValue('DEBUG_PAGE_HTML', html, { contentType: 'text/html' });
         await Actor.setValue('DEBUG_STRUCTURE_ANALYSIS', structureAnalysis);
         
-        log.info('✓ Saved debug HTML and structure analysis to key-value store');
+        log.info('Saved debug HTML and structure analysis to key-value store');
         log.info('  - DEBUG_PAGE_HTML: Full page HTML');
         log.info('  - DEBUG_STRUCTURE_ANALYSIS: Structure analysis JSON');
 
@@ -922,16 +1184,21 @@ try {
     });
 
     // Validate input
-    if (!input.searchUrl?.trim()) {
-        if (!input.searchQuery?.trim() || !input.location?.trim()) {
-            throw new Error('Invalid input: Either provide a "searchUrl" OR both "searchQuery" and "location" are required');
-        }
+    if (!input.searchUrl?.trim() && !input.searchQuery?.trim()) {
+        throw new Error('Invalid input: Provide either a "searchUrl" or at least a "searchQuery"');
     }
 
     const maxJobs = input.maxJobs ?? 20;
     if (maxJobs < 0 || maxJobs > 10000) {
         throw new Error('maxJobs must be between 0 and 10000');
     }
+
+    const maxPages = input.maxPages ?? 3;
+    if (maxPages < 0 || maxPages > 30) {
+        throw new Error('maxPages must be between 0 and 30 (0 = unlimited)');
+    }
+
+    const httpOnly = input.httpOnly ?? false;
 
     const searchUrl = buildSearchUrl(input);
     log.info(`Search URL: ${searchUrl}`);
@@ -947,30 +1214,76 @@ try {
 
     const seenJobUrls = new Set();
 
-    const proxyUrl = await proxyConfiguration.newUrl();
+    // HTTP-first fast path (Next.js/JSON/HTML)
+    const httpResult = await extractJobsHttpFirst(searchUrl, proxyConfiguration, {
+        maxJobs,
+        maxPages,
+    });
 
-    const crawler = new PlaywrightCrawler({
-        proxyConfiguration,
-        maxRequestsPerCrawl: 20,
-        maxConcurrency: 3,
-        navigationTimeoutSecs: 30,
-        requestHandlerTimeoutSecs: 120,
-        launchContext: {
-            launcher: firefox,
-            launchOptions: await camoufoxLaunchOptions({
-                headless: true,
-                proxy: proxyUrl,
-                geoip: true,
-                os: 'windows',
-                locale: 'en-US',
-                screen: {
-                    minWidth: 1024,
-                    maxWidth: 1920,
-                    minHeight: 768,
-                    maxHeight: 1080,
-                },
-            }),
-        },
+    pagesProcessed += httpResult.pagesProcessed;
+
+    if (httpResult.jobs.length > 0) {
+        log.info(`HTTP extraction succeeded with ${httpResult.jobs.length} jobs via ${httpResult.method}`);
+        extractionMethod = httpResult.method;
+
+        let jobsToSave = maxJobs > 0
+            ? httpResult.jobs.slice(0, Math.max(0, maxJobs - totalJobsScraped))
+            : httpResult.jobs;
+
+        const uniqueJobs = jobsToSave.filter(job => {
+            const key = job.url || `${job.title}-${job.company}-${job.location}`;
+            if (seenJobUrls.has(key)) return false;
+            seenJobUrls.add(key);
+            return true;
+        });
+
+        if (uniqueJobs.length < jobsToSave.length) {
+            log.info(`Removed ${jobsToSave.length - uniqueJobs.length} duplicate jobs from HTTP flow`);
+        }
+
+        if (uniqueJobs.length > 0) {
+            const enriched = await enrichJobsWithFullDescriptions(uniqueJobs, { proxyConfiguration });
+            await Actor.pushData(enriched);
+            totalJobsScraped += enriched.length;
+            log.info(`Saved ${enriched.length} jobs from HTTP flow`);
+        }
+    } else {
+        log.info('HTTP extraction returned no jobs, will try browser fallback unless disabled.');
+    }
+
+    const shouldUseBrowser = !httpOnly && totalJobsScraped === 0;
+
+    if (httpOnly) {
+        log.info('HTTP-only mode enabled; skipping browser fallback.');
+    } else if (!shouldUseBrowser) {
+        log.info('Skipping browser fallback because HTTP extraction succeeded.');
+    }
+
+    if (shouldUseBrowser) {
+        const proxyUrl = await proxyConfiguration.newUrl();
+
+        const crawler = new PlaywrightCrawler({
+            proxyConfiguration,
+            maxRequestsPerCrawl: maxPages > 0 ? maxPages : 20,
+            maxConcurrency: 3,
+            navigationTimeoutSecs: 30,
+            requestHandlerTimeoutSecs: 120,
+            launchContext: {
+                launcher: firefox,
+                launchOptions: await camoufoxLaunchOptions({
+                    headless: true,
+                    proxy: proxyUrl,
+                    geoip: true,
+                    os: 'windows',
+                    locale: 'en-US',
+                    screen: {
+                        minWidth: 1024,
+                        maxWidth: 1920,
+                        minHeight: 768,
+                        maxHeight: 1080,
+                    },
+                }),
+            },
 
         async requestHandler({ page, request }) {
             pagesProcessed++;
@@ -1055,7 +1368,7 @@ try {
 
                 // STRATEGY 1: Check if API interceptor captured jobs (FASTEST)
                 if (capturedApiJobs.length > 0) {
-                    log.info(`✓ Using intercepted API data: ${capturedApiJobs.length} jobs`);
+                    log.info(`Using intercepted API data: ${capturedApiJobs.length} jobs`);
                     
                     jobs = capturedApiJobs.map(job => {
                         const jobUrl = job.jobUrl || job.url || job.applyUrl || 
@@ -1089,7 +1402,7 @@ try {
                     jobs = await extractJobsViaMonsterAPI(page);
                     if (jobs.length > 0) {
                         extractionMethod = 'Monster Embedded API (Next.js)';
-                        log.info(`✓ Embedded API extraction successful: ${jobs.length} jobs`);
+                        log.info(`Embedded API extraction successful: ${jobs.length} jobs`);
                     }
                 }
 
@@ -1098,7 +1411,7 @@ try {
                     jobs = await extractJobsViaJsonLD(page);
                     if (jobs.length > 0) {
                         extractionMethod = 'JSON-LD Schema';
-                        log.info(`✓ JSON-LD extraction successful: ${jobs.length} jobs`);
+                        log.info(`JSON-LD extraction successful: ${jobs.length} jobs`);
                     }
                 }
 
@@ -1107,13 +1420,13 @@ try {
                     jobs = await extractJobDataViaHTML(page);
                     if (jobs.length > 0) {
                         extractionMethod = 'HTML Parsing (Cheerio)';
-                        log.info(`✓ HTML parsing successful: ${jobs.length} jobs`);
+                        log.info(`HTML parsing successful: ${jobs.length} jobs`);
                     }
                 }
 
                 // If still no jobs, save debug info and log page structure
                 if (jobs.length === 0) {
-                    log.error('❌ No jobs found with ANY extraction method');
+                        log.error('No jobs found with ANY extraction method');
                     log.warning('Saving debug info for analysis...');
                     await saveDebugInfo(page);
                     
@@ -1127,7 +1440,7 @@ try {
                 }
 
                 if (jobs.length > 0) {
-                    log.info(`✓ Successfully extracted ${jobs.length} jobs using: ${extractionMethod}`);
+                        log.info(`Successfully extracted ${jobs.length} jobs using: ${extractionMethod}`);
                     
                     let jobsToSave = maxJobs > 0
                         ? jobs.slice(0, Math.max(0, maxJobs - totalJobsScraped))
@@ -1159,11 +1472,11 @@ try {
                     if (jobsToSave.length > 0) {
                         await Actor.pushData(jobsToSave);
                         totalJobsScraped += jobsToSave.length;
-                        log.info(`✓ Saved ${jobsToSave.length} jobs. Total: ${totalJobsScraped}`);
+                            log.info(`Saved ${jobsToSave.length} jobs. Total: ${totalJobsScraped}`);
                     }
 
                     if (maxJobs > 0 && totalJobsScraped >= maxJobs) {
-                        log.info(`✓ Reached maximum jobs limit: ${maxJobs}`);
+                            log.info(`Reached maximum jobs limit: ${maxJobs}`);
                         return;
                     }
 
@@ -1220,8 +1533,9 @@ try {
         }
     });
 
-    log.info('Starting crawler with Camoufox for Cloudflare bypass...');
-    await crawler.run([searchUrl]);
+        log.info('Starting crawler with Camoufox for Cloudflare bypass...');
+        await crawler.run([searchUrl]);
+    }
 
     const endTime = Date.now();
     const duration = Math.round((endTime - startTime) / 1000);
@@ -1236,7 +1550,7 @@ try {
 
     await Actor.setValue('statistics', statistics);
 
-    log.info('✓ Scraping completed successfully!', statistics);
+    log.info('Scraping completed successfully!', statistics);
 
     if (totalJobsScraped > 0) {
         log.info(`Successfully scraped ${totalJobsScraped} jobs in ${duration} seconds`);
