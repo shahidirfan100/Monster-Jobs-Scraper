@@ -1,0 +1,21 @@
+{
+    "actorSpecification": 1,
+    "name": "monster-jobs-scraper",
+    "title": "Monster Jobs Scraper",
+    "description": "Extract job listings from Monster.com with advanced search capabilities. Get comprehensive job data including titles, companies, locations, salaries, descriptions, and direct application links. Perfect for job market analysis, recruitment automation, and employment research.",
+    "version": "1.0",
+    "categories": [
+        "BUSINESS",
+        "JOBS"
+    ],
+    "meta": {
+        "templateId": "monster-jobs-scraper",
+        "generatedBy": "Claude Sonnet 4.5"
+    },
+    "input": "./input_schema.json",
+    "output": "./output_schema.json",
+    "storages": {
+        "dataset": "./dataset_schema.json"
+    },
+    "dockerfile": "../Dockerfile"
+}

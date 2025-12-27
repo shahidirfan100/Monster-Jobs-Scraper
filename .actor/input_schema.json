@@ -1,0 +1,64 @@
+{
+    "title": "Monster Jobs Scraper Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "searchUrl": {
+            "title": "Search URL (Optional)",
+            "type": "string",
+            "description": "Direct Monster.com search URL to scrape from. If provided, other search parameters will be ignored. Example: https://www.monster.com/jobs/search?q=admin&where=&page=1&so=m.h.s",
+            "editor": "textfield",
+            "prefill": "https://www.monster.com/jobs/search?q=admin&where=&page=1&so=m.h.s"
+        },
+        "searchQuery": {
+            "title": "Search Query",
+            "type": "string",
+            "description": "Job title or keywords to search for (e.g., 'admin', 'software engineer', 'data analyst'). Required if searchUrl is not provided.",
+            "editor": "textfield",
+            "default": "admin",
+            "prefill": "admin"
+        },
+        "location": {
+            "title": "Location",
+            "type": "string",
+            "description": "Location to search for jobs (e.g., 'New York, NY', 'Remote', 'California'). Leave empty for all locations.",
+            "editor": "textfield",
+            "default": "",
+            "prefill": ""
+        },
+        "maxJobs": {
+            "title": "Maximum Jobs",
+            "type": "integer",
+            "description": "Maximum number of job listings to scrape (0 = unlimited). Default is 20 for optimal performance.",
+            "default": 20,
+            "minimum": 0,
+            "maximum": 10000
+        },
+        "sortBy": {
+            "title": "Sort By",
+            "type": "string",
+            "description": "Sort order for job listings",
+            "default": "date",
+            "enum": [
+                "date",
+                "relevance"
+            ],
+            "enumTitles": [
+                "Most Recent",
+                "Most Relevant"
+            ]
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "description": "Proxy settings for bypassing anti-bot protection. Recommended for reliable scraping.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true
+            }
+        }
+    },
+    "required": [
+        "searchQuery"
+    ]
+}

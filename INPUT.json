@@ -1,0 +1,9 @@
+{
+  "searchQuery": "admin",
+  "location": "",
+  "maxJobs": 20,
+  "sortBy": "date",
+  "proxyConfiguration": {
+    "useApifyProxy": true
+  }
+}
