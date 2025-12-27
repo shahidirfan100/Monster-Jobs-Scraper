@@ -216,6 +216,106 @@ function extractJobsFromDataObject(data) {
 }
 
 /**
+ * Normalize job result coming directly from Monster internal API response
+ */
+function normalizeMonsterApiJob(result) {
+    const job = result?.normalizedJobPosting || result?.jobPosting || result;
+    if (!job) return null;
+
+    const hiringOrg = job.hiringOrganization || {};
+    const locations = Array.isArray(job.jobLocation) ? job.jobLocation : (job.jobLocation ? [job.jobLocation] : []);
+    let location = '';
+    if (locations.length > 0) {
+        const address = locations[0].address || {};
+        location = [address.addressLocality, address.addressRegion, address.addressCountry].filter(Boolean).join(', ');
+    }
+
+    const salaryValue = job.baseSalary?.value || {};
+    let salary = 'Not specified';
+    if (salaryValue.minValue || salaryValue.maxValue) {
+        salary = `${salaryValue.minValue || ''}${salaryValue.maxValue ? ` - ${salaryValue.maxValue}` : ''} ${job.baseSalary?.currency || ''}`.trim();
+    }
+
+    const description = job.description || result?.snippet || '';
+
+    return {
+        title: job.title || job.jobTitle || result?.jobTitle || '',
+        company: hiringOrg.name || job.hiringCompany || '',
+        location,
+        salary,
+        jobType: Array.isArray(job.employmentType) ? job.employmentType.join(', ') : job.employmentType || 'Not specified',
+        postedDate: job.datePosted || job.listedDate || result?.datePosted || '',
+        descriptionHtml: description,
+        descriptionText: stripHtml(description),
+        url: job.url || result?.jobUrl || result?.detailUrl || '',
+        scrapedAt: new Date().toISOString(),
+    };
+}
+
+/**
+ * Call Monster internal JSON API (fast path)
+ */
+async function extractJobsViaInternalApi({ searchQuery, location, page = 1, pageSize = 25, proxyConfiguration }) {
+    const apiUrl = 'https://appsapi.monster.io/jobs-svx-service/v2/monster/search-jobs/samsearch/en-US?apikey=hkp1igv13sjt7ltv5kfdhjpj';
+
+    const body = {
+        jobQuery: searchQuery || '',
+        location: location || '',
+        page,
+        pageSize,
+        searchId: 'apify-monster',
+        includeJobs: true,
+        jobAdsRequest: true,
+        ignoreSpellCheck: true,
+    };
+
+    try {
+        const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
+        const response = await gotScraping({
+            url: apiUrl,
+            method: 'POST',
+            proxyUrl,
+            useHeaderGenerator: true,
+            headerGeneratorOptions: {
+                browsers: ['chrome'],
+                devices: ['desktop'],
+                operatingSystems: ['windows'],
+                locales: ['en-US', 'en'],
+            },
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json; charset=UTF-8',
+                'Origin': 'https://www.monster.com',
+                'Referer': 'https://www.monster.com/',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
+            },
+            timeout: { request: 20000 },
+            json: body,
+            retry: { limit: 2 },
+        });
+
+        if (response.statusCode !== 200) {
+            log.debug(`Internal API returned status ${response.statusCode}`);
+            return [];
+        }
+
+        const data = typeof response.body === 'object' ? response.body : JSON.parse(response.body);
+        const jobResults = data.jobResults || data.results || data.docs || [];
+        if (!Array.isArray(jobResults) || jobResults.length === 0) return [];
+
+        const normalized = jobResults.map(normalizeMonsterApiJob).filter(Boolean);
+        if (normalized.length > 0) {
+            log.info(`Internal API returned ${normalized.length} jobs (page ${page})`);
+        }
+        return normalized;
+    } catch (err) {
+        log.warning(`Internal API extraction failed: ${err.message}`);
+        return [];
+    }
+}
+
+/**
  * Extract jobs from __NEXT_DATA__ or embedded JSON in static HTML
  */
 function extractJobsFromNextDataHtml(html) {
@@ -1343,11 +1443,61 @@ try {
 
     const seenJobUrls = new Set();
 
+    // Internal JSON API fast path
+    let internalJobsSaved = 0;
+    if (input.searchQuery) {
+        const pageSize = 25;
+        for (let page = 1; (maxPages === 0 || page <= maxPages) && (maxJobs === 0 || internalJobsSaved < maxJobs); page++) {
+            const apiJobs = await extractJobsViaInternalApi({
+                searchQuery: input.searchQuery,
+                location: input.location,
+                page,
+                pageSize,
+                proxyConfiguration,
+            });
+
+            if (!apiJobs.length) {
+                if (page === 1) {
+                    log.debug('Internal API returned no jobs on first page; will proceed to HTTP/Browser.');
+                }
+                break;
+            }
+
+            pagesProcessed++;
+            extractionMethod = 'Internal JSON API';
+
+            let jobsToSave = apiJobs;
+            if (maxJobs > 0) {
+                jobsToSave = apiJobs.slice(0, Math.max(0, maxJobs - totalJobsScraped - internalJobsSaved));
+            }
+
+            const unique = jobsToSave.filter(job => {
+                const key = job.url || `${job.title}-${job.company}-${job.location}`;
+                if (seenJobUrls.has(key)) return false;
+                seenJobUrls.add(key);
+                return true;
+            });
+
+            if (unique.length > 0) {
+                const enriched = await enrichJobsWithFullDescriptions(unique, { proxyConfiguration });
+                await Actor.pushData(enriched);
+                internalJobsSaved += enriched.length;
+                totalJobsScraped += enriched.length;
+                log.info(`Saved ${enriched.length} jobs from internal API (page ${page})`);
+            }
+
+            if (maxJobs > 0 && totalJobsScraped >= maxJobs) break;
+        }
+    }
+
     // HTTP-first fast path (Next.js/JSON/HTML)
-    const httpResult = await extractJobsHttpFirst(searchUrl, proxyConfiguration, {
-        maxJobs,
-        maxPages,
-    });
+    const shouldRunHttp = maxJobs === 0 || totalJobsScraped < maxJobs;
+    const httpResult = shouldRunHttp
+        ? await extractJobsHttpFirst(searchUrl, proxyConfiguration, {
+            maxJobs,
+            maxPages,
+        })
+        : { jobs: [], pagesProcessed: 0, method: '' };
 
     pagesProcessed += httpResult.pagesProcessed;
 
