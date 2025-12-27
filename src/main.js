@@ -161,8 +161,12 @@ function extractJobsFromDataObject(data) {
     const jobCollections = [
         data?.props?.pageProps?.searchResults?.jobs,
         data?.props?.pageProps?.searchResults?.docs,
+        data?.props?.pageProps?.searchResults?.results,
         data?.props?.pageProps?.jobs,
         data?.props?.pageProps?.initialJobs,
+        data?.props?.pageProps?.serp?.jobs,
+        data?.props?.pageProps?.serpResults?.jobs,
+        data?.props?.pageProps?.results?.jobs,
         data?.jobResults,
         data?.searchResults?.docs,
         data?.searchResults?.results,
@@ -175,6 +179,36 @@ function extractJobsFromDataObject(data) {
     if (!jobArray && Array.isArray(data)) jobArray = data;
     if (!jobArray && data?.itemListElement && Array.isArray(data.itemListElement)) {
         jobArray = data.itemListElement.map(item => item.item || item).filter(Boolean);
+    }
+
+    // Deep search: find any array of objects that look like jobs (have jobTitle/title + jobId/jobUrl)
+    if (!jobArray) {
+        const visited = new WeakSet();
+        const candidates = [];
+
+        const walk = (node, depth = 0) => {
+            if (!node || typeof node !== 'object' || depth > 6) return;
+            if (visited.has(node)) return;
+            visited.add(node);
+
+            if (Array.isArray(node) && node.length > 0 && typeof node[0] === 'object') {
+                const hasJobShape = node.some(item =>
+                    item &&
+                    (item.jobTitle || item.title || item.name) &&
+                    (item.jobId || item.jobid || item.jobUrl || item.jobViewUrl || item.url || item.applyUrl)
+                );
+                if (hasJobShape) {
+                    candidates.push(node);
+                }
+            }
+
+            for (const value of Object.values(node)) {
+                walk(value, depth + 1);
+            }
+        };
+
+        walk(data);
+        if (candidates.length > 0) jobArray = candidates[0];
     }
 
     if (!jobArray || !Array.isArray(jobArray)) return [];
@@ -898,6 +932,79 @@ async function extractJobsHttpFirst(searchUrl, proxyConfiguration, options = {})
 }
 
 /**
+ * Collect jobs from the AJAX-loaded sidebar list (Playwright only)
+ */
+async function collectSidebarAjaxJobs(page, maxJobs) {
+    const jobs = [];
+    try {
+        const headingSelector = 'h3.indexmodern__JobCardHeading-sc-9vl52l-20';
+        // Wait briefly for sidebar items to render
+        await page.waitForSelector(headingSelector, { timeout: 8000 });
+
+        // Try to click "Load" / "More" buttons until we reach maxJobs or no more buttons
+        const loadButtons = [
+            'button:has-text("Load more")',
+            'button:has-text("Load jobs")',
+            'button:has-text("See more")',
+            'button[aria-label*="load" i]',
+        ];
+
+        const clickMoreIfAvailable = async () => {
+            for (const sel of loadButtons) {
+                const btn = page.locator(sel);
+                if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+                    await btn.click({ timeout: 2000 }).catch(() => {});
+                    await page.waitForTimeout(1200);
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        // Loop loading more until we hit maxJobs or no more buttons
+        while (jobs.length < maxJobs) {
+            const sidebarJobs = await page.$$eval(headingSelector, (nodes) => {
+                return nodes.map((node) => {
+                    const title = node.textContent?.trim() || '';
+                    // Find nearest anchor ancestor or sibling
+                    let linkEl = node.closest('a');
+                    if (!linkEl) {
+                        const parentLink = node.parentElement?.querySelector('a');
+                        if (parentLink) linkEl = parentLink;
+                    }
+                    const href = linkEl?.getAttribute('href') || '';
+                    return { title, href };
+                }).filter(j => j.title && j.href);
+            });
+
+            for (const item of sidebarJobs) {
+                if (jobs.length >= maxJobs) break;
+                const url = item.href.startsWith('http') ? item.href : `https://www.monster.com${item.href}`;
+                jobs.push({
+                    title: item.title,
+                    company: '',
+                    location: '',
+                    salary: 'Not specified',
+                    jobType: 'Not specified',
+                    postedDate: '',
+                    descriptionHtml: '',
+                    descriptionText: '',
+                    url,
+                    scrapedAt: new Date().toISOString(),
+                });
+            }
+
+            if (jobs.length >= maxJobs) break;
+            const clicked = await clickMoreIfAvailable();
+            if (!clicked) break;
+        }
+    } catch (err) {
+        log.debug(`Sidebar AJAX collection failed: ${err.message}`);
+    }
+    return jobs;
+}
+
+/**
  * Extract job data from a single Monster.com job card element
  * Updated with comprehensive selector patterns
  */
@@ -906,17 +1013,24 @@ function extractJobFromElement($, $el) {
         // Job Title - comprehensive selector list
         const titleSelectors = [
             'h2[data-test-id="svx-job-card-title"] a',   // Current Monster structure
+            'h2[data-test-id="svx-job-card-title"]',
             'h2[data-testid="job-title"] a',
+            '[data-testid="job-title"]',
             'a[data-test-id="job-card-title"]',
             'a[data-testid="job-card-title"]',
             'h2 a[data-test-id*="title"]',
             '.job-card-title a',
+            '.job-card-title',
             '.job-title a',
+            '.job-title',
             'h2.title a',
+            'h2.title',
             'a[href*="/job-openings/"]',
             'a[href*="/job/"]',
             'h2 a',
-            'h3 a'
+            'h3 a',
+            '[data-job-title]',
+            '[aria-label*="job" i]'
         ];
 
         let title = '';
@@ -925,8 +1039,8 @@ function extractJobFromElement($, $el) {
         for (const selector of titleSelectors) {
             const titleEl = $el.find(selector).first();
             if (titleEl.length) {
-                title = titleEl.text().trim();
-                url = titleEl.attr('href') || '';
+                title = titleEl.text().trim() || titleEl.attr('data-job-title') || titleEl.attr('aria-label') || '';
+                url = titleEl.attr('href') || titleEl.attr('data-job-url') || '';
                 if (url && !url.startsWith('http')) {
                     url = `https://www.monster.com${url}`;
                 }
@@ -948,7 +1062,8 @@ function extractJobFromElement($, $el) {
             'div[class*="company"]',
             'span[class*="company"]',
             'div[class*="Company"]',
-            '[data-company]'
+            '[data-company]',
+            '[data-job-company]'
         ];
 
         let company = '';
@@ -972,7 +1087,8 @@ function extractJobFromElement($, $el) {
             'div[class*="location"]',
             'span[class*="location"]',
             'div[class*="Location"]',
-            '[data-location]'
+            '[data-location]',
+            '[data-job-location]'
         ];
 
         let location = '';
@@ -1017,6 +1133,7 @@ function extractJobFromElement($, $el) {
             '.description',
             'div[class*="Description"]',
             'div[class*="snippet"]',
+            '[data-job-snippet]',
             'p'
         ];
 
@@ -1035,6 +1152,7 @@ function extractJobFromElement($, $el) {
             '[data-testid="job-card-date"]',
             '[data-testid="posted-date"]',
             '.posted-date',
+            'time[datetime]',
             'time',
             'span[class*="date"]',
             'span[class*="time"]',
@@ -1047,6 +1165,17 @@ function extractJobFromElement($, $el) {
             if (dateEl.length && dateEl.text().trim()) {
                 postedDate = dateEl.text().trim();
                 break;
+            }
+        }
+
+        // Fallback: use data attributes if URL missing
+        if (!url) {
+            const dataUrl = $el.attr('data-job-url') || $el.attr('data-url');
+            const jobId = $el.attr('data-jobid') || $el.attr('data-job-id');
+            if (dataUrl) {
+                url = dataUrl.startsWith('http') ? dataUrl : `https://www.monster.com${dataUrl}`;
+            } else if (jobId) {
+                url = `https://www.monster.com/job-openings/${jobId}`;
             }
         }
 
@@ -1366,10 +1495,22 @@ try {
 
                 let jobs = [];
 
+                // STRATEGY 0: AJAX sidebar list using provided selector
+                const sidebarJobs = await collectSidebarAjaxJobs(
+                    page,
+                    Math.max(1, maxJobs > 0 ? maxJobs - totalJobsScraped : 50)
+                );
+                if (sidebarJobs.length > 0) {
+                    log.info(`Sidebar AJAX extraction found ${sidebarJobs.length} jobs, enriching details...`);
+                    const enrichedSidebar = await enrichJobsWithFullDescriptions(sidebarJobs, { page, proxyConfiguration });
+                    jobs.push(...enrichedSidebar);
+                    extractionMethod = 'Sidebar AJAX + Detail';
+                }
+
                 // STRATEGY 1: Check if API interceptor captured jobs (FASTEST)
                 if (capturedApiJobs.length > 0) {
                     log.info(`Using intercepted API data: ${capturedApiJobs.length} jobs`);
-                    
+
                     jobs = capturedApiJobs.map(job => {
                         const jobUrl = job.jobUrl || job.url || job.applyUrl || 
                                       job.jobViewUrl || job.detailUrl ||
