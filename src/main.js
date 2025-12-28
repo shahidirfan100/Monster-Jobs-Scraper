@@ -439,26 +439,30 @@ try {
             log.info(`Processing page ${pagesProcessed}: ${request.url}`);
 
             try {
-                // WARMUP: Visit homepage first to build session history (anti-DataDome)
+                // OPTIONAL WARMUP: Visit homepage first to build session (anti-DataDome)
+                // Skip if it fails - main page access is more important
                 if (pagesProcessed === 1) {
-                    log.info('Warmup: Visiting Monster.com homepage to build session...');
-                    await page.goto('https://www.monster.com', {
-                        waitUntil: 'domcontentloaded',
-                        timeout: 60000,
-                    });
+                    try {
+                        log.info('Warmup: Visiting Monster.com homepage...');
+                        await page.goto('https://www.monster.com', {
+                            waitUntil: 'domcontentloaded',
+                            timeout: 30000, // Reduced timeout
+                        });
 
-                    // Browse homepage naturally
-                    await page.waitForTimeout(3000 + Math.random() * 2000);
-                    await humanMouseMove(page);
-                    await page.evaluate(() => window.scrollBy(0, 300));
-                    await page.waitForTimeout(2000 + Math.random() * 1000);
+                        // Quick browse
+                        await page.waitForTimeout(2000);
+                        await humanMouseMove(page);
+                        await page.waitForTimeout(1000);
 
-                    log.info('Warmup complete, now navigating to search page...');
-                    await page.waitForTimeout(2000 + Math.random() * 2000);
+                        log.info('✓ Warmup complete');
+                    } catch (warmupError) {
+                        log.warning(`Warmup failed (${warmupError.message}), continuing anyway...`);
+                        // Continue to main page even if warmup fails
+                    }
                 }
 
-                // Extended pre-navigation delay
-                const preDelay = 5000 + Math.random() * 5000;
+                // Pre-navigation delay (reduced)
+                const preDelay = 2000 + Math.random() * 3000;
                 log.debug(`Pre-navigation delay: ${Math.round(preDelay)}ms`);
                 await page.waitForTimeout(preDelay);
 
