@@ -127,26 +127,80 @@ function stripHtml(html) {
 
 /**
  * Normalize Monster job object variants into our unified format
+ * Handles both jobViewResultsData structure and direct job objects
  */
 function normalizeMonsterJob(job) {
-    const jobUrl = job.jobUrl || job.url || job.applyUrl ||
-        job.jobViewUrl || job.detailUrl ||
-        (job.jobId ? `https://www.monster.com/job-openings/${job.jobId}` : '');
+    if (!job) return null;
 
-    let location = job.location || job.jobLocation || job.city || job.state || '';
-    if (typeof location === 'object' && location !== null) {
-        location = [location.city, location.state || location.stateProvince, location.country].filter(Boolean).join(', ');
+    // Handle Monster's jobViewResultsData structure (nested jobPosting)
+    const posting = job.jobPosting || job.normalizedJobPosting || job;
+    const hiringOrg = posting.hiringOrganization || {};
+
+    // Extract title from nested structure
+    const title = posting.title || job.jobTitle || job.title || job.name || '';
+    if (!title) return null; // Skip jobs without titles
+
+    // Extract company from nested structure
+    const company = hiringOrg.name || posting.companyName ||
+        job.company || job.companyName || job.hiringCompany ||
+        job.companyDisplayName || '';
+
+    // Extract location from nested structure
+    let location = '';
+    const jobLocations = posting.jobLocation || job.jobLocation;
+    if (Array.isArray(jobLocations) && jobLocations.length > 0) {
+        const addr = jobLocations[0].address || jobLocations[0];
+        location = [addr.addressLocality, addr.addressRegion, addr.addressCountry]
+            .filter(Boolean).join(', ');
+    } else if (typeof jobLocations === 'object' && jobLocations !== null) {
+        const addr = jobLocations.address || jobLocations;
+        location = [addr.addressLocality || addr.city, addr.addressRegion || addr.state, addr.addressCountry || addr.country]
+            .filter(Boolean).join(', ');
+    } else {
+        location = job.location || job.city || job.state || '';
+        if (typeof location === 'object' && location !== null) {
+            location = [location.city, location.state || location.stateProvince, location.country].filter(Boolean).join(', ');
+        }
     }
 
-    const description = job.description || job.jobDescription || job.snippet || job.text || '';
+    // Extract URL - Monster uses detailUrl, mesco, or standard url fields
+    const jobUrl = job.detailUrl || job.jobViewUrl || posting.url || job.jobUrl || job.url || job.applyUrl ||
+        (job.mesco ? `https://www.monster.com/job-openings/${job.mesco}` : '') ||
+        (job.jobId ? `https://www.monster.com/job-openings/${job.jobId}` : '');
+
+    // Extract salary
+    let salary = 'Not specified';
+    const baseSalary = posting.baseSalary || job.baseSalary;
+    if (baseSalary) {
+        const salaryValue = baseSalary.value || baseSalary;
+        if (salaryValue.minValue || salaryValue.maxValue) {
+            salary = `${salaryValue.minValue || ''}${salaryValue.maxValue ? ` - ${salaryValue.maxValue}` : ''} ${baseSalary.currency || ''}`.trim();
+        } else if (typeof salaryValue === 'string') {
+            salary = salaryValue;
+        }
+    } else if (job.salary || job.compensation || job.estimatedSalary || job.pay) {
+        salary = job.salary || job.compensation || job.estimatedSalary || job.pay;
+    }
+
+    // Extract employment type
+    let jobType = 'Not specified';
+    const empType = posting.employmentType || job.employmentType || job.jobType || job.type;
+    if (Array.isArray(empType)) {
+        jobType = empType.join(', ');
+    } else if (empType) {
+        jobType = empType;
+    }
+
+    // Extract description
+    const description = posting.description || job.description || job.jobDescription || job.snippet || job.text || '';
 
     return {
-        title: job.title || job.jobTitle || job.name || '',
-        company: job.company || job.companyName || job.hiringCompany || job.companyDisplayName || '',
+        title,
+        company,
         location,
-        salary: job.salary || job.compensation || job.estimatedSalary || job.pay || 'Not specified',
-        jobType: job.jobType || job.employmentType || job.type || 'Not specified',
-        postedDate: job.postedDate || job.datePosted || job.listedDate || job.postedAt || '',
+        salary,
+        jobType,
+        postedDate: posting.datePosted || job.postedDate || job.datePosted || job.listedDate || job.postedAt || '',
         descriptionHtml: description,
         descriptionText: stripHtml(description),
         url: jobUrl,
@@ -159,6 +213,11 @@ function normalizeMonsterJob(job) {
  */
 function extractJobsFromDataObject(data) {
     const jobCollections = [
+        // Monster.com primary paths (discovered via browser investigation)
+        data?.props?.pageProps?.jobViewResultsData,
+        data?.props?.pageProps?.jobViewResultsDataCompact,
+        data?.props?.pageProps?.jobResults,
+        // Standard Next.js job site paths
         data?.props?.pageProps?.searchResults?.jobs,
         data?.props?.pageProps?.searchResults?.docs,
         data?.props?.pageProps?.searchResults?.results,
@@ -260,13 +319,15 @@ async function extractJobsViaInternalApi({ searchQuery, location, page = 1, page
 
     const body = {
         jobQuery: searchQuery || '',
-        location: location || '',
+        locationQuery: location || '',
         page,
         pageSize,
-        searchId: 'apify-monster',
+        searchId: `apify-${Date.now()}`,
         includeJobs: true,
         jobAdsRequest: true,
         ignoreSpellCheck: true,
+        filters: {},
+        searchType: 'Search',
     };
 
     try {
@@ -301,8 +362,12 @@ async function extractJobsViaInternalApi({ searchQuery, location, page = 1, page
         }
 
         const data = typeof response.body === 'object' ? response.body : JSON.parse(response.body);
+        log.debug(`Internal API response keys: ${Object.keys(data).join(', ')}`);
         const jobResults = data.jobResults || data.results || data.docs || [];
-        if (!Array.isArray(jobResults) || jobResults.length === 0) return [];
+        if (!Array.isArray(jobResults) || jobResults.length === 0) {
+            log.debug('Internal API returned no job results in expected paths');
+            return [];
+        }
 
         const normalized = jobResults.map(normalizeMonsterApiJob).filter(Boolean);
         if (normalized.length > 0) {
@@ -342,7 +407,11 @@ function extractJobsFromNextDataHtml(html) {
 
     try {
         const data = JSON.parse(nextScript);
+        log.debug(`__NEXT_DATA__ pageProps keys: ${Object.keys(data?.props?.pageProps || {}).join(', ')}`);
         const jobs = extractJobsFromDataObject(data);
+        if (jobs.length > 0) {
+            log.info(`Extracted ${jobs.length} jobs from __NEXT_DATA__`);
+        }
         return { jobs, source: '__NEXT_DATA__' };
     } catch (err) {
         log.debug(`Failed to parse __NEXT_DATA__: ${err.message}`);
@@ -399,28 +468,28 @@ async function setupAPIInterceptor(page) {
     // Set up response interceptor to capture API calls
     page.on('response', async (response) => {
         const url = response.url();
-        
+
         // Monster.com API endpoints patterns
-        if (url.includes('/job-search/') || 
-            url.includes('/jobsearch') || 
+        if (url.includes('/job-search/') ||
+            url.includes('/jobsearch') ||
             url.includes('/api/search') ||
             url.includes('query=') && url.includes('where=')) {
-            
+
             try {
                 const contentType = response.headers()['content-type'] || '';
-                
+
                 if (contentType.includes('application/json')) {
                     const data = await response.json();
-                    
+
                     // Extract jobs from various API response structures
                     let jobArray = null;
-                    
+
                     if (data.jobResults) jobArray = data.jobResults;
                     else if (data.docs) jobArray = data.docs;
                     else if (data.results) jobArray = data.results;
                     else if (data.data?.jobs) jobArray = data.data.jobs;
                     else if (Array.isArray(data)) jobArray = data;
-                    
+
                     if (jobArray && Array.isArray(jobArray)) {
                         log.info(`Intercepted API response with ${jobArray.length} jobs from: ${url.substring(0, 100)}`);
                         capturedJobs.push(...jobArray);
@@ -466,13 +535,13 @@ async function extractJobsViaDirectAPI(searchQuery, location, page = 1) {
             try {
                 const data = JSON.parse(response.body);
                 log.info('Successfully fetched data via direct API');
-                
+
                 // Extract job array
                 let jobArray = null;
                 if (data.jobResults) jobArray = data.jobResults;
                 else if (data.docs) jobArray = data.docs;
                 else if (data.results) jobArray = data.results;
-                
+
                 if (jobArray && Array.isArray(jobArray)) {
                     return jobArray;
                 }
@@ -501,7 +570,7 @@ async function extractJobsViaMonsterAPI(page) {
             if (window.__NEXT_DATA__) {
                 return { type: 'nextjs', data: JSON.stringify(window.__NEXT_DATA__) };
             }
-            
+
             // Check for React/Redux initial state
             if (window.__INITIAL_STATE__) {
                 return { type: 'redux', data: JSON.stringify(window.__INITIAL_STATE__) };
@@ -517,8 +586,8 @@ async function extractJobsViaMonsterAPI(page) {
             for (const script of scripts) {
                 const content = script.textContent || '';
                 // Look for job data patterns
-                if (content.includes('jobResults') || 
-                    content.includes('searchResults') || 
+                if (content.includes('jobResults') ||
+                    content.includes('searchResults') ||
                     content.includes('"docs":[{') ||
                     content.includes('__NEXT_DATA__')) {
                     return { type: 'script', data: content };
@@ -539,7 +608,7 @@ async function extractJobsViaMonsterAPI(page) {
 
         try {
             let data;
-            
+
             // Extract JSON from script content if needed
             if (apiData.type === 'script') {
                 // Try to find JSON object in script
@@ -1053,7 +1122,7 @@ async function collectSidebarAjaxJobs(page, maxJobs) {
             for (const sel of loadButtons) {
                 const btn = page.locator(sel);
                 if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
-                    await btn.click({ timeout: 2000 }).catch(() => {});
+                    await btn.click({ timeout: 2000 }).catch(() => { });
                     await page.waitForTimeout(1200);
                     return true;
                 }
@@ -1317,7 +1386,7 @@ async function saveDebugInfo(page) {
             title: $('title').text(),
             url: page.url(),
             hasCloudflare: html.includes('Just a moment') || html.includes('cf-browser'),
-            
+
             // Count various elements
             elementCounts: {
                 articles: $('article').length,
@@ -1328,13 +1397,13 @@ async function saveDebugInfo(page) {
                 links: $('a').length,
                 jobLinks: $('a[href*="/job"]').length,
             },
-            
+
             // Sample data-test-id attributes
             sampleDataTestIds: [],
-            
+
             // Sample class names
             sampleClasses: [],
-            
+
             // Check for common Monster.com elements
             monsterElements: {
                 hasNextData: html.includes('__NEXT_DATA__'),
@@ -1389,7 +1458,7 @@ async function saveDebugInfo(page) {
         // Save full HTML and analysis
         await Actor.setValue('DEBUG_PAGE_HTML', html, { contentType: 'text/html' });
         await Actor.setValue('DEBUG_STRUCTURE_ANALYSIS', structureAnalysis);
-        
+
         log.info('Saved debug HTML and structure analysis to key-value store');
         log.info('  - DEBUG_PAGE_HTML: Full page HTML');
         log.info('  - DEBUG_STRUCTURE_ANALYSIS: Structure analysis JSON');
@@ -1564,265 +1633,265 @@ try {
                 }),
             },
 
-        async requestHandler({ page, request }) {
-            pagesProcessed++;
-            log.info(`Processing page ${pagesProcessed}: ${request.url}`);
+            async requestHandler({ page, request }) {
+                pagesProcessed++;
+                log.info(`Processing page ${pagesProcessed}: ${request.url}`);
 
-            try {
-                // Set up API interceptor BEFORE navigation
-                const capturedApiJobs = await setupAPIInterceptor(page);
+                try {
+                    // Set up API interceptor BEFORE navigation
+                    const capturedApiJobs = await setupAPIInterceptor(page);
 
-                await page.setExtraHTTPHeaders({
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-                    'Sec-Fetch-Dest': 'document',
-                    'Sec-Fetch-Mode': 'navigate',
-                    'Sec-Fetch-Site': 'none',
-                    'Sec-Fetch-User': '?1',
-                    'Upgrade-Insecure-Requests': '1',
-                });
+                    await page.setExtraHTTPHeaders({
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'none',
+                        'Sec-Fetch-User': '?1',
+                        'Upgrade-Insecure-Requests': '1',
+                    });
 
-                await page.goto(request.url, {
-                    waitUntil: 'domcontentloaded',
-                    timeout: 30000
-                });
+                    await page.goto(request.url, {
+                        waitUntil: 'domcontentloaded',
+                        timeout: 30000
+                    });
 
-                await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => { });
+                    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => { });
 
-                // Check for Cloudflare challenge
-                let cloudflareDetected = false;
-                let retryCount = 0;
-                const maxRetries = 3;
+                    // Check for Cloudflare challenge
+                    let cloudflareDetected = false;
+                    let retryCount = 0;
+                    const maxRetries = 3;
 
-                while (retryCount < maxRetries) {
-                    const title = await page.title();
-                    const bodyText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '');
+                    while (retryCount < maxRetries) {
+                        const title = await page.title();
+                        const bodyText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '');
 
-                    if (title.includes('Just a moment') ||
-                        title.includes('Cloudflare') ||
-                        bodyText.includes('unusual traffic') ||
-                        bodyText.includes('Checking your browser')) {
+                        if (title.includes('Just a moment') ||
+                            title.includes('Cloudflare') ||
+                            bodyText.includes('unusual traffic') ||
+                            bodyText.includes('Checking your browser')) {
 
-                        cloudflareDetected = true;
-                        log.warning(`Cloudflare challenge detected (attempt ${retryCount + 1}/${maxRetries})`);
+                            cloudflareDetected = true;
+                            log.warning(`Cloudflare challenge detected (attempt ${retryCount + 1}/${maxRetries})`);
 
-                        await page.waitForTimeout(3000);
+                            await page.waitForTimeout(3000);
 
-                        try {
-                            const turnstileFrame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
-                            const checkbox = turnstileFrame.locator('input[type="checkbox"], .cf-turnstile-wrapper');
+                            try {
+                                const turnstileFrame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
+                                const checkbox = turnstileFrame.locator('input[type="checkbox"], .cf-turnstile-wrapper');
 
-                            if (await checkbox.count() > 0) {
-                                log.info('Found Turnstile checkbox, attempting click...');
-                                await checkbox.first().click({ timeout: 5000 });
-                                await page.waitForTimeout(3000);
+                                if (await checkbox.count() > 0) {
+                                    log.info('Found Turnstile checkbox, attempting click...');
+                                    await checkbox.first().click({ timeout: 5000 });
+                                    await page.waitForTimeout(3000);
+                                }
+                            } catch (clickErr) {
+                                log.debug('No clickable Turnstile element found');
                             }
-                        } catch (clickErr) {
-                            log.debug('No clickable Turnstile element found');
+
+                            await page.waitForTimeout(5000);
+                            await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => { });
+
+                            retryCount++;
+                        } else {
+                            if (cloudflareDetected) {
+                                log.info('Cloudflare challenge bypassed successfully!');
+                            }
+                            break;
                         }
-
-                        await page.waitForTimeout(5000);
-                        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => { });
-
-                        retryCount++;
-                    } else {
-                        if (cloudflareDetected) {
-                            log.info('Cloudflare challenge bypassed successfully!');
-                        }
-                        break;
-                    }
-                }
-
-                if (retryCount >= maxRetries) {
-                    log.error('Failed to bypass Cloudflare after maximum retries');
-                    await saveDebugInfo(page);
-                    return;
-                }
-
-                // Wait for dynamic content to load
-                await page.waitForTimeout(2000);
-
-                let jobs = [];
-
-                // STRATEGY 0: AJAX sidebar list using provided selector
-                const sidebarJobs = await collectSidebarAjaxJobs(
-                    page,
-                    Math.max(1, maxJobs > 0 ? maxJobs - totalJobsScraped : 50)
-                );
-                if (sidebarJobs.length > 0) {
-                    log.info(`Sidebar AJAX extraction found ${sidebarJobs.length} jobs, enriching details...`);
-                    const enrichedSidebar = await enrichJobsWithFullDescriptions(sidebarJobs, { page, proxyConfiguration });
-                    jobs.push(...enrichedSidebar);
-                    extractionMethod = 'Sidebar AJAX + Detail';
-                }
-
-                // STRATEGY 1: Check if API interceptor captured jobs (FASTEST)
-                if (capturedApiJobs.length > 0) {
-                    log.info(`Using intercepted API data: ${capturedApiJobs.length} jobs`);
-
-                    jobs = capturedApiJobs.map(job => {
-                        const jobUrl = job.jobUrl || job.url || job.applyUrl || 
-                                      job.jobViewUrl || job.detailUrl ||
-                                      (job.jobId ? `https://www.monster.com/job-openings/${job.jobId}` : '');
-                        
-                        let location = job.location || job.jobLocation || job.city || '';
-                        if (typeof location === 'object') {
-                            location = [location.city, location.state, location.country].filter(Boolean).join(', ');
-                        }
-
-                        return {
-                            title: job.title || job.jobTitle || job.name || '',
-                            company: job.company || job.companyName || job.hiringCompany || job.companyDisplayName || '',
-                            location,
-                            salary: job.salary || job.compensation || job.estimatedSalary || 'Not specified',
-                            jobType: job.jobType || job.employmentType || job.type || 'Not specified',
-                            postedDate: job.postedDate || job.datePosted || job.listedDate || job.postedAt || '',
-                            descriptionHtml: job.description || job.jobDescription || job.snippet || '',
-                            descriptionText: stripHtml(job.description || job.jobDescription || job.snippet || ''),
-                            url: jobUrl,
-                            scrapedAt: new Date().toISOString()
-                        };
-                    });
-                    
-                    extractionMethod = 'API Interceptor (Network)';
-                }
-
-                // STRATEGY 2: Try Monster embedded API/Next.js data
-                if (jobs.length === 0) {
-                    jobs = await extractJobsViaMonsterAPI(page);
-                    if (jobs.length > 0) {
-                        extractionMethod = 'Monster Embedded API (Next.js)';
-                        log.info(`Embedded API extraction successful: ${jobs.length} jobs`);
-                    }
-                }
-
-                // STRATEGY 3: Try JSON-LD structured data
-                if (jobs.length === 0) {
-                    jobs = await extractJobsViaJsonLD(page);
-                    if (jobs.length > 0) {
-                        extractionMethod = 'JSON-LD Schema';
-                        log.info(`JSON-LD extraction successful: ${jobs.length} jobs`);
-                    }
-                }
-
-                // STRATEGY 4: Fall back to HTML parsing with Cheerio
-                if (jobs.length === 0) {
-                    jobs = await extractJobDataViaHTML(page);
-                    if (jobs.length > 0) {
-                        extractionMethod = 'HTML Parsing (Cheerio)';
-                        log.info(`HTML parsing successful: ${jobs.length} jobs`);
-                    }
-                }
-
-                // If still no jobs, save debug info and log page structure
-                if (jobs.length === 0) {
-                        log.error('No jobs found with ANY extraction method');
-                    log.warning('Saving debug info for analysis...');
-                    await saveDebugInfo(page);
-                    
-                    // Log page title and URL for debugging
-                    const pageTitle = await page.title();
-                    const pageUrl = page.url();
-                    log.warning(`Page Title: ${pageTitle}`);
-                    log.warning(`Page URL: ${pageUrl}`);
-                    
-                    return; // Skip this page
-                }
-
-                if (jobs.length > 0) {
-                        log.info(`Successfully extracted ${jobs.length} jobs using: ${extractionMethod}`);
-                    
-                    let jobsToSave = maxJobs > 0
-                        ? jobs.slice(0, Math.max(0, maxJobs - totalJobsScraped))
-                        : jobs;
-
-                    const uniqueJobs = jobsToSave.filter(job => {
-                        if (!job.url) return true;
-
-                        if (seenJobUrls.has(job.url)) {
-                            log.debug(`Skipping duplicate job: ${job.title} (${job.url})`);
-                            return false;
-                        }
-
-                        seenJobUrls.add(job.url);
-                        return true;
-                    });
-
-                    if (uniqueJobs.length < jobsToSave.length) {
-                        log.info(`Removed ${jobsToSave.length - uniqueJobs.length} duplicate jobs`);
                     }
 
-                    jobsToSave = uniqueJobs;
-
-                    if (jobsToSave.length > 0) {
-                        log.info('Enriching jobs with full descriptions from detail pages...');
-                        jobsToSave = await enrichJobsWithFullDescriptions(jobsToSave, page);
-                    }
-
-                    if (jobsToSave.length > 0) {
-                        await Actor.pushData(jobsToSave);
-                        totalJobsScraped += jobsToSave.length;
-                            log.info(`Saved ${jobsToSave.length} jobs. Total: ${totalJobsScraped}`);
-                    }
-
-                    if (maxJobs > 0 && totalJobsScraped >= maxJobs) {
-                            log.info(`Reached maximum jobs limit: ${maxJobs}`);
+                    if (retryCount >= maxRetries) {
+                        log.error('Failed to bypass Cloudflare after maximum retries');
+                        await saveDebugInfo(page);
                         return;
                     }
 
-                    // Monster.com pagination - check for next page
-                    const currentUrl = new URL(request.url);
-                    const currentPage = parseInt(currentUrl.searchParams.get('page') || '1');
+                    // Wait for dynamic content to load
+                    await page.waitForTimeout(2000);
 
-                    // Check if next page button exists and is not disabled
-                    const hasNextPage = await page.evaluate(() => {
-                        // Look for pagination buttons
-                        const nextButton = document.querySelector('button[aria-label*="next" i]') ||
-                            document.querySelector('a[aria-label*="next" i]') ||
-                            document.querySelector('button:has-text("Next")') ||
-                            document.querySelector('a:has-text("Next")') ||
-                            document.querySelector('[data-test-id="pagination-next"]') ||
-                            document.querySelector('.pagination button:last-child');
+                    let jobs = [];
 
-                        if (nextButton) {
-                            const isDisabled = nextButton.hasAttribute('disabled') ||
-                                nextButton.classList.contains('disabled') ||
-                                nextButton.getAttribute('aria-disabled') === 'true';
-                            return !isDisabled;
+                    // STRATEGY 0: AJAX sidebar list using provided selector
+                    const sidebarJobs = await collectSidebarAjaxJobs(
+                        page,
+                        Math.max(1, maxJobs > 0 ? maxJobs - totalJobsScraped : 50)
+                    );
+                    if (sidebarJobs.length > 0) {
+                        log.info(`Sidebar AJAX extraction found ${sidebarJobs.length} jobs, enriching details...`);
+                        const enrichedSidebar = await enrichJobsWithFullDescriptions(sidebarJobs, { page, proxyConfiguration });
+                        jobs.push(...enrichedSidebar);
+                        extractionMethod = 'Sidebar AJAX + Detail';
+                    }
+
+                    // STRATEGY 1: Check if API interceptor captured jobs (FASTEST)
+                    if (capturedApiJobs.length > 0) {
+                        log.info(`Using intercepted API data: ${capturedApiJobs.length} jobs`);
+
+                        jobs = capturedApiJobs.map(job => {
+                            const jobUrl = job.jobUrl || job.url || job.applyUrl ||
+                                job.jobViewUrl || job.detailUrl ||
+                                (job.jobId ? `https://www.monster.com/job-openings/${job.jobId}` : '');
+
+                            let location = job.location || job.jobLocation || job.city || '';
+                            if (typeof location === 'object') {
+                                location = [location.city, location.state, location.country].filter(Boolean).join(', ');
+                            }
+
+                            return {
+                                title: job.title || job.jobTitle || job.name || '',
+                                company: job.company || job.companyName || job.hiringCompany || job.companyDisplayName || '',
+                                location,
+                                salary: job.salary || job.compensation || job.estimatedSalary || 'Not specified',
+                                jobType: job.jobType || job.employmentType || job.type || 'Not specified',
+                                postedDate: job.postedDate || job.datePosted || job.listedDate || job.postedAt || '',
+                                descriptionHtml: job.description || job.jobDescription || job.snippet || '',
+                                descriptionText: stripHtml(job.description || job.jobDescription || job.snippet || ''),
+                                url: jobUrl,
+                                scrapedAt: new Date().toISOString()
+                            };
+                        });
+
+                        extractionMethod = 'API Interceptor (Network)';
+                    }
+
+                    // STRATEGY 2: Try Monster embedded API/Next.js data
+                    if (jobs.length === 0) {
+                        jobs = await extractJobsViaMonsterAPI(page);
+                        if (jobs.length > 0) {
+                            extractionMethod = 'Monster Embedded API (Next.js)';
+                            log.info(`Embedded API extraction successful: ${jobs.length} jobs`);
+                        }
+                    }
+
+                    // STRATEGY 3: Try JSON-LD structured data
+                    if (jobs.length === 0) {
+                        jobs = await extractJobsViaJsonLD(page);
+                        if (jobs.length > 0) {
+                            extractionMethod = 'JSON-LD Schema';
+                            log.info(`JSON-LD extraction successful: ${jobs.length} jobs`);
+                        }
+                    }
+
+                    // STRATEGY 4: Fall back to HTML parsing with Cheerio
+                    if (jobs.length === 0) {
+                        jobs = await extractJobDataViaHTML(page);
+                        if (jobs.length > 0) {
+                            extractionMethod = 'HTML Parsing (Cheerio)';
+                            log.info(`HTML parsing successful: ${jobs.length} jobs`);
+                        }
+                    }
+
+                    // If still no jobs, save debug info and log page structure
+                    if (jobs.length === 0) {
+                        log.error('No jobs found with ANY extraction method');
+                        log.warning('Saving debug info for analysis...');
+                        await saveDebugInfo(page);
+
+                        // Log page title and URL for debugging
+                        const pageTitle = await page.title();
+                        const pageUrl = page.url();
+                        log.warning(`Page Title: ${pageTitle}`);
+                        log.warning(`Page URL: ${pageUrl}`);
+
+                        return; // Skip this page
+                    }
+
+                    if (jobs.length > 0) {
+                        log.info(`Successfully extracted ${jobs.length} jobs using: ${extractionMethod}`);
+
+                        let jobsToSave = maxJobs > 0
+                            ? jobs.slice(0, Math.max(0, maxJobs - totalJobsScraped))
+                            : jobs;
+
+                        const uniqueJobs = jobsToSave.filter(job => {
+                            if (!job.url) return true;
+
+                            if (seenJobUrls.has(job.url)) {
+                                log.debug(`Skipping duplicate job: ${job.title} (${job.url})`);
+                                return false;
+                            }
+
+                            seenJobUrls.add(job.url);
+                            return true;
+                        });
+
+                        if (uniqueJobs.length < jobsToSave.length) {
+                            log.info(`Removed ${jobsToSave.length - uniqueJobs.length} duplicate jobs`);
                         }
 
-                        return false;
-                    });
+                        jobsToSave = uniqueJobs;
 
-                    if (hasNextPage && totalJobsScraped < maxJobs) {
-                        const nextPage = currentPage + 1;
-                        currentUrl.searchParams.set('page', nextPage.toString());
-                        const nextPageUrl = currentUrl.toString();
+                        if (jobsToSave.length > 0) {
+                            log.info('Enriching jobs with full descriptions from detail pages...');
+                            jobsToSave = await enrichJobsWithFullDescriptions(jobsToSave, page);
+                        }
 
-                        log.info(`Found next page: ${nextPageUrl} (page ${nextPage})`);
+                        if (jobsToSave.length > 0) {
+                            await Actor.pushData(jobsToSave);
+                            totalJobsScraped += jobsToSave.length;
+                            log.info(`Saved ${jobsToSave.length} jobs. Total: ${totalJobsScraped}`);
+                        }
 
-                        await crawler.addRequests([{
-                            url: nextPageUrl,
-                            uniqueKey: nextPageUrl
-                        }]);
-                    } else if (!hasNextPage) {
-                        log.info('No next page button found - reached last page');
+                        if (maxJobs > 0 && totalJobsScraped >= maxJobs) {
+                            log.info(`Reached maximum jobs limit: ${maxJobs}`);
+                            return;
+                        }
+
+                        // Monster.com pagination - check for next page
+                        const currentUrl = new URL(request.url);
+                        const currentPage = parseInt(currentUrl.searchParams.get('page') || '1');
+
+                        // Check if next page button exists and is not disabled
+                        const hasNextPage = await page.evaluate(() => {
+                            // Look for pagination buttons
+                            const nextButton = document.querySelector('button[aria-label*="next" i]') ||
+                                document.querySelector('a[aria-label*="next" i]') ||
+                                document.querySelector('button:has-text("Next")') ||
+                                document.querySelector('a:has-text("Next")') ||
+                                document.querySelector('[data-test-id="pagination-next"]') ||
+                                document.querySelector('.pagination button:last-child');
+
+                            if (nextButton) {
+                                const isDisabled = nextButton.hasAttribute('disabled') ||
+                                    nextButton.classList.contains('disabled') ||
+                                    nextButton.getAttribute('aria-disabled') === 'true';
+                                return !isDisabled;
+                            }
+
+                            return false;
+                        });
+
+                        if (hasNextPage && totalJobsScraped < maxJobs) {
+                            const nextPage = currentPage + 1;
+                            currentUrl.searchParams.set('page', nextPage.toString());
+                            const nextPageUrl = currentUrl.toString();
+
+                            log.info(`Found next page: ${nextPageUrl} (page ${nextPage})`);
+
+                            await crawler.addRequests([{
+                                url: nextPageUrl,
+                                uniqueKey: nextPageUrl
+                            }]);
+                        } else if (!hasNextPage) {
+                            log.info('No next page button found - reached last page');
+                        }
                     }
+
+                } catch (error) {
+                    log.error(`Error processing page: ${error.message}`, {
+                        url: request.url,
+                        stack: error.stack
+                    });
                 }
+            },
 
-            } catch (error) {
-                log.error(`Error processing page: ${error.message}`, {
-                    url: request.url,
-                    stack: error.stack
-                });
+            async failedRequestHandler({ request }, error) {
+                log.error(`Request failed: ${request.url} - ${error.message}`);
             }
-        },
-
-        async failedRequestHandler({ request }, error) {
-            log.error(`Request failed: ${request.url} - ${error.message}`);
-        }
-    });
+        });
 
         log.info('Starting crawler with Camoufox for Cloudflare bypass...');
         await crawler.run([searchUrl]);
