@@ -281,9 +281,12 @@ try {
 
     log.info(`Search URL: ${searchUrl}`);
 
+    // Create proxy configuration - get a single URL to pass to Camoufox
     const proxyConfiguration = await Actor.createProxyConfiguration(
         input.proxyConfiguration || { useApifyProxy: true }
     );
+    const proxyUrl = await proxyConfiguration.newUrl();
+    log.info(`Using proxy: ${proxyUrl?.split('@')[1] || 'none'}`);
 
     let totalJobsScraped = 0;
     let pagesProcessed = 0;
@@ -291,34 +294,49 @@ try {
     const startTime = Date.now();
     const seenJobUrls = new Set();
 
-    // Create Playwright crawler with Camoufox
+    // Get Camoufox launch options with proxy included
+    const camoufoxOptions = await camoufoxLaunchOptions({
+        headless: true,
+        // Pass proxy directly to Camoufox - this is the correct way
+        proxy: proxyUrl ? {
+            server: proxyUrl,
+        } : undefined,
+        // Stealth options
+        humanize: true,
+        geoip: true,
+        screen: {
+            minWidth: 1280,
+            maxWidth: 1920,
+            minHeight: 720,
+            maxHeight: 1080,
+        },
+    });
+
+    // Create Playwright crawler WITHOUT proxyConfiguration (Camoufox handles it)
     const crawler = new PlaywrightCrawler({
-        proxyConfiguration,
+        // Do NOT pass proxyConfiguration here - Camoufox handles proxy internally
         maxRequestsPerCrawl: maxPages > 0 ? maxPages : 10,
         maxConcurrency: 1,
-        navigationTimeoutSecs: 60,
-        requestHandlerTimeoutSecs: 120,
+        navigationTimeoutSecs: 90,
+        requestHandlerTimeoutSecs: 180,
 
-        // Disable fingerprints - Camoufox handles this
+        // Use incognito pages for isolation
         browserPoolOptions: {
             useFingerprints: false,
+            preLaunchHooks: [
+                async (pageId, launchContext) => {
+                    launchContext.launchOptions = {
+                        ...launchContext.launchOptions,
+                        ...camoufoxOptions,
+                    };
+                },
+            ],
         },
 
         launchContext: {
             launcher: firefox,
-            launchOptions: await camoufoxLaunchOptions({
-                headless: true,
-                geoip: true,
-                humanize: true,
-                os: ['windows', 'macos', 'linux'],
-                fonts: ['Arial', 'Helvetica', 'Times New Roman'],
-                screen: {
-                    minWidth: 1024,
-                    maxWidth: 1920,
-                    minHeight: 768,
-                    maxHeight: 1080,
-                },
-            }),
+            useIncognitoPages: true,
+            launchOptions: camoufoxOptions,
         },
 
         async requestHandler({ page, request }) {
@@ -326,34 +344,46 @@ try {
             log.info(`Processing page ${pagesProcessed}: ${request.url}`);
 
             try {
-                // Human-like delay before navigation
-                await page.waitForTimeout(1000 + Math.random() * 2000);
+                // Human-like random delay before navigation
+                const delay = 2000 + Math.random() * 3000;
+                log.debug(`Waiting ${Math.round(delay)}ms before navigation...`);
+                await page.waitForTimeout(delay);
 
-                // Navigate with retry logic
+                // Navigate with extended timeout
                 await page.goto(request.url, {
                     waitUntil: 'domcontentloaded',
-                    timeout: 45000,
+                    timeout: 60000,
                 });
 
-                // Wait for content to load
-                await page.waitForTimeout(3000);
+                // Wait for page to settle
+                await page.waitForTimeout(3000 + Math.random() * 2000);
 
-                // Check for Cloudflare/DataDome challenge
+                // Check for anti-bot challenges
                 const pageContent = await page.content();
-                if (pageContent.includes('Just a moment') || pageContent.includes('Access blocked')) {
-                    log.warning('Anti-bot challenge detected, waiting...');
-                    await page.waitForTimeout(5000);
+                const pageTitle = await page.title();
 
-                    // Try clicking any challenge buttons
-                    try {
-                        const challengeBtn = page.locator('input[type="button"], button[type="submit"]').first();
-                        if (await challengeBtn.isVisible({ timeout: 2000 })) {
-                            await challengeBtn.click();
-                            await page.waitForTimeout(5000);
-                        }
-                    } catch (e) {
-                        // No challenge button found
+                if (pageContent.includes('Just a moment') ||
+                    pageContent.includes('Access blocked') ||
+                    pageContent.includes('Enable JavaScript') ||
+                    pageTitle.includes('Cloudflare')) {
+
+                    log.warning('Anti-bot challenge detected, waiting for bypass...');
+
+                    // Wait longer and try mouse movements
+                    await page.mouse.move(100 + Math.random() * 500, 100 + Math.random() * 300);
+                    await page.waitForTimeout(5000);
+                    await page.mouse.move(200 + Math.random() * 400, 200 + Math.random() * 200);
+                    await page.waitForTimeout(3000);
+
+                    // Check if still blocked
+                    const newContent = await page.content();
+                    if (newContent.includes('Just a moment') || newContent.includes('Access blocked')) {
+                        log.error('Failed to bypass anti-bot challenge');
+                        const screenshot = await page.screenshot({ fullPage: true });
+                        await Actor.setValue('BLOCKED_SCREENSHOT', screenshot, { contentType: 'image/png' });
+                        return;
                     }
+                    log.info('Anti-bot challenge bypassed!');
                 }
 
                 let jobs = [];
@@ -387,7 +417,6 @@ try {
                     const screenshot = await page.screenshot({ fullPage: true });
                     await Actor.setValue('DEBUG_SCREENSHOT', screenshot, { contentType: 'image/png' });
 
-                    const pageTitle = await page.title();
                     log.warning(`Page title: ${pageTitle}`);
                     return;
                 }
@@ -413,7 +442,7 @@ try {
             } catch (error) {
                 log.error(`Page processing failed: ${error.message}`);
 
-                // Save debug info
+                // Save debug info on error
                 try {
                     const screenshot = await page.screenshot();
                     await Actor.setValue('ERROR_SCREENSHOT', screenshot, { contentType: 'image/png' });
