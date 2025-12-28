@@ -91,14 +91,15 @@ async function extractJobsFromNextData(page) {
         });
 
         if (!nextDataContent) {
-            log.debug('No __NEXT_DATA__ found');
+            log.info('⚠️ No __NEXT_DATA__ script found in page');
             return [];
         }
 
         const data = JSON.parse(nextDataContent);
         const pageProps = data?.props?.pageProps || {};
 
-        log.debug(`pageProps keys: ${Object.keys(pageProps).join(', ')}`);
+        // Show what keys are available (INFO level for debugging)
+        log.info(`📊 __NEXT_DATA__ pageProps keys: ${Object.keys(pageProps).join(', ')}`);
 
         const jobArray = pageProps.jobViewResultsData ||
             pageProps.jobViewResultsDataCompact ||
@@ -108,7 +109,7 @@ async function extractJobsFromNextData(page) {
             [];
 
         if (!Array.isArray(jobArray) || jobArray.length === 0) {
-            log.debug('No jobs found in __NEXT_DATA__');
+            log.info(`⚠️ No jobs found in __NEXT_DATA__. Tried: jobViewResultsData, jobViewResultsDataCompact, jobResults, jobs, searchResults.docs`);
             return [];
         }
 
@@ -183,45 +184,113 @@ async function extractJobsFromDOM(page) {
             ];
 
             let jobCards = [];
+            let matchedSelector = '';
             for (const sel of selectors) {
                 jobCards = document.querySelectorAll(sel);
-                if (jobCards.length > 0) break;
+                if (jobCards.length > 0) {
+                    matchedSelector = sel;
+                    break;
+                }
             }
 
             jobCards.forEach(card => {
+                // Title and URL
                 const titleEl = card.querySelector('h2 a, h3 a, [data-test-id*="title"] a, a[href*="job-openings"]');
                 const title = titleEl?.textContent?.trim() || '';
                 const url = titleEl?.href || '';
 
-                const companyEl = card.querySelector('[data-test-id*="company"], [class*="company"], [class*="Company"]');
-                const company = companyEl?.textContent?.trim() || '';
+                // Company - try multiple selectors
+                const companySelectors = [
+                    '[data-test-id="svx-job-card-company"]',
+                    '[data-test-id*="company"]',
+                    '[class*="company" i]',
+                    '[class*="Company"]',
+                    'h4',
+                    '.company-name',
+                    'div[data-test-id*="company"] span'
+                ];
+                let company = '';
+                for (const sel of companySelectors) {
+                    const el = card.querySelector(sel);
+                    if (el && el.textContent.trim()) {
+                        company = el.textContent.trim();
+                        break;
+                    }
+                }
 
-                const locationEl = card.querySelector('[data-test-id*="location"], [class*="location"], [class*="Location"]');
-                const location = locationEl?.textContent?.trim() || '';
+                // Location
+                const locationSelectors = [
+                    '[data-test-id="svx-job-card-location"]',
+                    '[data-test-id*="location"]',
+                    '[class*="location" i]',
+                    '[class*="Location"]',
+                    '.location'
+                ];
+                let location = '';
+                for (const sel of locationSelectors) {
+                    const el = card.querySelector(sel);
+                    if (el && el.textContent.trim()) {
+                        location = el.textContent.trim();
+                        break;
+                    }
+                }
+
+                // Description/snippet
+                const descSelectors = [
+                    '[data-test-id="svx-job-card-summary"]',
+                    '[class*="summary" i]',
+                    '[class*="description" i]',
+                    '[class*="snippet" i]',
+                    'p'
+                ];
+                let description = '';
+                for (const sel of descSelectors) {
+                    const el = card.querySelector(sel);
+                    if (el && el.textContent.trim()) {
+                        description = el.textContent.trim();
+                        break;
+                    }
+                }
+
+                // Salary
+                const salarySelectors = [
+                    '[data-test-id*="salary"]',
+                    '[class*="salary" i]',
+                    '[class*="compensation" i]'
+                ];
+                let salary = 'Not specified';
+                for (const sel of salarySelectors) {
+                    const el = card.querySelector(sel);
+                    if (el && el.textContent.trim()) {
+                        salary = el.textContent.trim();
+                        break;
+                    }
+                }
 
                 if (title && url) {
                     results.push({
                         title,
-                        company,
-                        location,
-                        salary: 'Not specified',
+                        company: company || 'Not specified',
+                        location: location || 'Not specified',
+                        salary,
                         jobType: 'Not specified',
                         postedDate: '',
-                        descriptionHtml: '',
-                        descriptionText: '',
+                        descriptionHtml: description,
+                        descriptionText: description, // Same as HTML for now
                         url,
                         scrapedAt: new Date().toISOString()
                     });
                 }
             });
 
-            return results;
+            return { results, matchedSelector };
         });
 
-        if (jobs.length > 0) {
-            log.info(`Found ${jobs.length} jobs in DOM`);
+        const jobResults = jobs.results || [];
+        if (jobResults.length > 0) {
+            log.info(`Found ${jobResults.length} jobs in DOM using selector: ${jobs.matchedSelector}`);
         }
-        return jobs;
+        return jobResults;
     } catch (error) {
         log.warning(`DOM extraction failed: ${error.message}`);
         return [];
@@ -290,9 +359,14 @@ try {
 
     log.info(`Search URL: ${searchUrl}`);
 
-    // Create proxy configuration - Apify template pattern
+    // Create proxy configuration - FORCE RESIDENTIAL for DataDome bypass
     const proxyConfiguration = await Actor.createProxyConfiguration(
-        input.proxyConfiguration || { useApifyProxy: true, checkAccess: true }
+        input.proxyConfiguration || {
+            useApifyProxy: true,
+            groups: ['RESIDENTIAL'], // Force residential IPs
+            countryCode: 'US', // US residential IPs
+            checkAccess: true
+        }
     );
 
     let totalJobsScraped = 0;
@@ -365,12 +439,30 @@ try {
             log.info(`Processing page ${pagesProcessed}: ${request.url}`);
 
             try {
-                // Human-like delay before navigation
-                const preDelay = 3000 + Math.random() * 4000;
+                // WARMUP: Visit homepage first to build session history (anti-DataDome)
+                if (pagesProcessed === 1) {
+                    log.info('Warmup: Visiting Monster.com homepage to build session...');
+                    await page.goto('https://www.monster.com', {
+                        waitUntil: 'domcontentloaded',
+                        timeout: 60000,
+                    });
+
+                    // Browse homepage naturally
+                    await page.waitForTimeout(3000 + Math.random() * 2000);
+                    await humanMouseMove(page);
+                    await page.evaluate(() => window.scrollBy(0, 300));
+                    await page.waitForTimeout(2000 + Math.random() * 1000);
+
+                    log.info('Warmup complete, now navigating to search page...');
+                    await page.waitForTimeout(2000 + Math.random() * 2000);
+                }
+
+                // Extended pre-navigation delay
+                const preDelay = 5000 + Math.random() * 5000;
                 log.debug(`Pre-navigation delay: ${Math.round(preDelay)}ms`);
                 await page.waitForTimeout(preDelay);
 
-                // Navigate
+                // Navigate to target
                 await page.goto(request.url, {
                     waitUntil: 'domcontentloaded',
                     timeout: 90000,
