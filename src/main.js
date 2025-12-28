@@ -20,20 +20,16 @@ function stripHtml(html) {
 function normalizeMonsterJob(job) {
     if (!job) return null;
 
-    // Handle Monster's jobViewResultsData structure (nested jobPosting)
     const posting = job.jobPosting || job.normalizedJobPosting || job;
     const hiringOrg = posting.hiringOrganization || {};
 
-    // Extract title
     const title = posting.title || job.jobTitle || job.title || job.name || '';
     if (!title) return null;
 
-    // Extract company
     const company = hiringOrg.name || posting.companyName ||
         job.company || job.companyName || job.hiringCompany ||
         job.companyDisplayName || '';
 
-    // Extract location
     let location = '';
     const jobLocations = posting.jobLocation || job.jobLocation;
     if (Array.isArray(jobLocations) && jobLocations.length > 0) {
@@ -48,12 +44,10 @@ function normalizeMonsterJob(job) {
         location = job.location || job.city || '';
     }
 
-    // Extract URL
     const jobUrl = job.detailUrl || job.jobViewUrl || posting.url || job.jobUrl || job.url ||
         (job.mesco ? `https://www.monster.com/job-openings/${job.mesco}` : '') ||
         (job.jobId ? `https://www.monster.com/job-openings/${job.jobId}` : '');
 
-    // Extract salary
     let salary = 'Not specified';
     const baseSalary = posting.baseSalary || job.baseSalary;
     if (baseSalary?.value) {
@@ -65,11 +59,9 @@ function normalizeMonsterJob(job) {
         salary = job.salary;
     }
 
-    // Extract job type
     const empType = posting.employmentType || job.employmentType || job.jobType;
     const jobType = Array.isArray(empType) ? empType.join(', ') : empType || 'Not specified';
 
-    // Extract description
     const description = posting.description || job.description || job.snippet || '';
 
     return {
@@ -87,7 +79,7 @@ function normalizeMonsterJob(job) {
 }
 
 /**
- * Extract jobs from __NEXT_DATA__ script tag via Playwright
+ * Extract jobs from __NEXT_DATA__ script tag
  */
 async function extractJobsFromNextData(page) {
     log.info('Extracting jobs from __NEXT_DATA__...');
@@ -108,7 +100,6 @@ async function extractJobsFromNextData(page) {
 
         log.debug(`pageProps keys: ${Object.keys(pageProps).join(', ')}`);
 
-        // Monster.com primary paths
         const jobArray = pageProps.jobViewResultsData ||
             pageProps.jobViewResultsDataCompact ||
             pageProps.jobResults ||
@@ -134,7 +125,7 @@ async function extractJobsFromNextData(page) {
 }
 
 /**
- * Extract jobs from JSON-LD structured data via Playwright
+ * Extract jobs from JSON-LD structured data
  */
 async function extractJobsFromJsonLD(page) {
     log.info('Extracting jobs from JSON-LD...');
@@ -175,7 +166,7 @@ async function extractJobsFromJsonLD(page) {
 }
 
 /**
- * Extract jobs from DOM elements via Playwright (fallback)
+ * Extract jobs from DOM elements (fallback)
  */
 async function extractJobsFromDOM(page) {
     log.info('Extracting jobs from DOM elements...');
@@ -184,7 +175,6 @@ async function extractJobsFromDOM(page) {
         const jobs = await page.evaluate(() => {
             const results = [];
 
-            // Try multiple selectors for job cards
             const selectors = [
                 '[data-test-id="svx-job-card"]',
                 '[class*="JobCard"]',
@@ -199,16 +189,13 @@ async function extractJobsFromDOM(page) {
             }
 
             jobCards.forEach(card => {
-                // Extract title
                 const titleEl = card.querySelector('h2 a, h3 a, [data-test-id*="title"] a, a[href*="job-openings"]');
                 const title = titleEl?.textContent?.trim() || '';
                 const url = titleEl?.href || '';
 
-                // Extract company
                 const companyEl = card.querySelector('[data-test-id*="company"], [class*="company"], [class*="Company"]');
                 const company = companyEl?.textContent?.trim() || '';
 
-                // Extract location
                 const locationEl = card.querySelector('[data-test-id*="location"], [class*="location"], [class*="Location"]');
                 const location = locationEl?.textContent?.trim() || '';
 
@@ -259,6 +246,29 @@ function buildSearchUrl(input) {
 }
 
 /**
+ * Human-like mouse movements
+ */
+async function humanMouseMove(page) {
+    const viewportSize = await page.viewportSize();
+    if (!viewportSize) return;
+
+    const { width, height } = viewportSize;
+
+    // Random starting position
+    let x = Math.random() * width * 0.8 + width * 0.1;
+    let y = Math.random() * height * 0.8 + height * 0.1;
+
+    // Move mouse in natural curves
+    for (let i = 0; i < 3; i++) {
+        const targetX = Math.random() * width * 0.6 + width * 0.2;
+        const targetY = Math.random() * height * 0.6 + height * 0.2;
+
+        await page.mouse.move(targetX, targetY, { steps: 10 + Math.floor(Math.random() * 20) });
+        await page.waitForTimeout(100 + Math.random() * 200);
+    }
+}
+
+/**
  * Main Actor execution
  */
 try {
@@ -270,7 +280,6 @@ try {
         maxJobs: input.maxJobs
     });
 
-    // Validate input
     if (!input.searchUrl?.trim() && !input.searchQuery?.trim()) {
         throw new Error('Provide either "searchUrl" or "searchQuery"');
     }
@@ -281,12 +290,10 @@ try {
 
     log.info(`Search URL: ${searchUrl}`);
 
-    // Create proxy configuration - get a single URL to pass to Camoufox
+    // Create proxy configuration - Apify template pattern
     const proxyConfiguration = await Actor.createProxyConfiguration(
-        input.proxyConfiguration || { useApifyProxy: true }
+        input.proxyConfiguration || { useApifyProxy: true, checkAccess: true }
     );
-    const proxyUrl = await proxyConfiguration.newUrl();
-    log.info(`Using proxy: ${proxyUrl?.split('@')[1] || 'none'}`);
 
     let totalJobsScraped = 0;
     let pagesProcessed = 0;
@@ -294,88 +301,114 @@ try {
     const startTime = Date.now();
     const seenJobUrls = new Set();
 
-    // Get Camoufox launch options with proxy included
-    const camoufoxOptions = await camoufoxLaunchOptions({
-        headless: true,
-        // Pass proxy directly to Camoufox - this is the correct way
-        proxy: proxyUrl ? {
-            server: proxyUrl,
-        } : undefined,
-        // Stealth options
-        humanize: true,
-        geoip: true,
-        screen: {
-            minWidth: 1280,
-            maxWidth: 1920,
-            minHeight: 720,
-            maxHeight: 1080,
-        },
-    });
+    log.info('Starting crawler with Camoufox (Apify template pattern)...');
 
-    // Create Playwright crawler WITHOUT proxyConfiguration (Camoufox handles it)
+    // Create Playwright crawler
     const crawler = new PlaywrightCrawler({
-        // Do NOT pass proxyConfiguration here - Camoufox handles proxy internally
+        // Pass proxy configuration - PlaywrightCrawler will handle it
+        proxyConfiguration,
         maxRequestsPerCrawl: maxPages > 0 ? maxPages : 10,
         maxConcurrency: 1,
-        navigationTimeoutSecs: 90,
-        requestHandlerTimeoutSecs: 180,
+        navigationTimeoutSecs: 120,
+        requestHandlerTimeoutSecs: 300,
+        maxRequestRetries: 5,
 
-        // Use incognito pages for isolation
+        // Browser pool options for Camoufox
         browserPoolOptions: {
-            useFingerprints: false,
-            preLaunchHooks: [
-                async (pageId, launchContext) => {
-                    launchContext.launchOptions = {
-                        ...launchContext.launchOptions,
-                        ...camoufoxOptions,
-                    };
-                },
-            ],
+            useFingerprints: false, // Camoufox handles fingerprinting
+            retireBrowserAfterPageCount: 1, // Fresh browser for each request
         },
 
         launchContext: {
             launcher: firefox,
-            useIncognitoPages: true,
-            launchOptions: camoufoxOptions,
+            // EXACT Apify template pattern for launchOptions
+            launchOptions: await camoufoxLaunchOptions({
+                headless: true,
+                proxy: await proxyConfiguration.newUrl(), // Pass proxy URL to Camoufox
+                geoip: true,
+                humanize: true,
+                screen: {
+                    minWidth: 1280,
+                    maxWidth: 1920,
+                    minHeight: 720,
+                    maxHeight: 1080,
+                },
+            }),
         },
+
+        // Pre-navigation hook for additional stealth
+        preNavigationHooks: [
+            async ({ page }) => {
+                // Set realistic viewport
+                await page.setViewportSize({
+                    width: 1366 + Math.floor(Math.random() * 200),
+                    height: 768 + Math.floor(Math.random() * 100),
+                });
+
+                // Set extra headers
+                await page.setExtraHTTPHeaders({
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-User': '?1',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Cache-Control': 'max-age=0',
+                });
+            },
+        ],
 
         async requestHandler({ page, request }) {
             pagesProcessed++;
             log.info(`Processing page ${pagesProcessed}: ${request.url}`);
 
             try {
-                // Human-like random delay before navigation
-                const delay = 2000 + Math.random() * 3000;
-                log.debug(`Waiting ${Math.round(delay)}ms before navigation...`);
-                await page.waitForTimeout(delay);
+                // Human-like delay before navigation
+                const preDelay = 3000 + Math.random() * 4000;
+                log.debug(`Pre-navigation delay: ${Math.round(preDelay)}ms`);
+                await page.waitForTimeout(preDelay);
 
-                // Navigate with extended timeout
+                // Navigate
                 await page.goto(request.url, {
                     waitUntil: 'domcontentloaded',
-                    timeout: 60000,
+                    timeout: 90000,
                 });
 
+                // Human-like mouse movements
+                await humanMouseMove(page);
+
                 // Wait for page to settle
-                await page.waitForTimeout(3000 + Math.random() * 2000);
+                await page.waitForTimeout(4000 + Math.random() * 3000);
 
                 // Check for anti-bot challenges
                 const pageContent = await page.content();
                 const pageTitle = await page.title();
 
-                if (pageContent.includes('Just a moment') ||
+                const isBlocked = pageContent.includes('Just a moment') ||
                     pageContent.includes('Access blocked') ||
                     pageContent.includes('Enable JavaScript') ||
-                    pageTitle.includes('Cloudflare')) {
+                    pageContent.includes('Pardon Our Interruption') ||
+                    pageTitle.toLowerCase().includes('cloudflare') ||
+                    pageTitle.toLowerCase().includes('blocked');
 
-                    log.warning('Anti-bot challenge detected, waiting for bypass...');
+                if (isBlocked) {
+                    log.warning('Anti-bot challenge detected, attempting bypass...');
 
-                    // Wait longer and try mouse movements
-                    await page.mouse.move(100 + Math.random() * 500, 100 + Math.random() * 300);
-                    await page.waitForTimeout(5000);
-                    await page.mouse.move(200 + Math.random() * 400, 200 + Math.random() * 200);
-                    await page.waitForTimeout(3000);
+                    // Extended wait with mouse movements
+                    for (let i = 0; i < 3; i++) {
+                        await humanMouseMove(page);
+                        await page.waitForTimeout(3000 + Math.random() * 2000);
+                    }
 
-                    // Check if still blocked
+                    // Try scrolling
+                    await page.evaluate(() => {
+                        window.scrollBy(0, 300);
+                    });
+                    await page.waitForTimeout(2000);
+
+                    // Check again
                     const newContent = await page.content();
                     if (newContent.includes('Just a moment') || newContent.includes('Access blocked')) {
                         log.error('Failed to bypass anti-bot challenge');
@@ -386,15 +419,19 @@ try {
                     log.info('Anti-bot challenge bypassed!');
                 }
 
+                // Additional scroll to trigger lazy loading
+                await page.evaluate(() => window.scrollBy(0, 500));
+                await page.waitForTimeout(2000);
+
                 let jobs = [];
 
-                // STRATEGY 1: Try __NEXT_DATA__ (most reliable)
+                // STRATEGY 1: __NEXT_DATA__
                 jobs = await extractJobsFromNextData(page);
                 if (jobs.length > 0) {
                     extractionMethod = 'NEXT_DATA';
                 }
 
-                // STRATEGY 2: Try JSON-LD
+                // STRATEGY 2: JSON-LD
                 if (jobs.length === 0) {
                     jobs = await extractJobsFromJsonLD(page);
                     if (jobs.length > 0) {
@@ -402,7 +439,7 @@ try {
                     }
                 }
 
-                // STRATEGY 3: Try DOM extraction
+                // STRATEGY 3: DOM
                 if (jobs.length === 0) {
                     jobs = await extractJobsFromDOM(page);
                     if (jobs.length > 0) {
@@ -413,11 +450,15 @@ try {
                 if (jobs.length === 0) {
                     log.warning('No jobs found on this page');
 
-                    // Save debug screenshot
+                    // Save debug data
                     const screenshot = await page.screenshot({ fullPage: true });
+                    const html = await page.content();
                     await Actor.setValue('DEBUG_SCREENSHOT', screenshot, { contentType: 'image/png' });
+                    await Actor.setValue('DEBUG_HTML', html, { contentType: 'text/html' });
 
                     log.warning(`Page title: ${pageTitle}`);
+                    log.warning(`Page URL: ${page.url()}`);
+                    log.warning('Saved DEBUG_SCREENSHOT and DEBUG_HTML to key-value store for inspection');
                     return;
                 }
 
@@ -436,18 +477,16 @@ try {
                 if (jobsToSave.length > 0) {
                     await Actor.pushData(jobsToSave);
                     totalJobsScraped += jobsToSave.length;
-                    log.info(`Saved ${jobsToSave.length} jobs (total: ${totalJobsScraped})`);
+                    log.info(`✓ Saved ${jobsToSave.length} jobs (total: ${totalJobsScraped})`);
                 }
 
             } catch (error) {
                 log.error(`Page processing failed: ${error.message}`);
-
-                // Save debug info on error
                 try {
                     const screenshot = await page.screenshot();
                     await Actor.setValue('ERROR_SCREENSHOT', screenshot, { contentType: 'image/png' });
                 } catch (e) {
-                    // Ignore screenshot errors
+                    // Ignore
                 }
             }
         },
