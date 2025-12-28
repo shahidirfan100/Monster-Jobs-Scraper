@@ -623,10 +623,20 @@ async function extractJobsViaMonsterAPI(page) {
                 data = JSON.parse(apiData.data);
             }
 
-            // Navigate through Next.js data structure
+            // Navigate through Next.js data structure - Monster.com specific paths first
             let jobArray = null;
 
-            if (data.props?.pageProps?.jobs) {
+            // Monster.com primary paths (discovered via browser investigation)
+            if (data.props?.pageProps?.jobViewResultsData) {
+                jobArray = data.props.pageProps.jobViewResultsData;
+                log.info('Found jobs in jobViewResultsData path');
+            } else if (data.props?.pageProps?.jobViewResultsDataCompact) {
+                jobArray = data.props.pageProps.jobViewResultsDataCompact;
+                log.info('Found jobs in jobViewResultsDataCompact path');
+            } else if (data.props?.pageProps?.jobResults) {
+                jobArray = data.props.pageProps.jobResults;
+                log.info('Found jobs in jobResults path');
+            } else if (data.props?.pageProps?.jobs) {
                 jobArray = data.props.pageProps.jobs;
             } else if (data.props?.pageProps?.searchResults?.docs) {
                 jobArray = data.props.pageProps.searchResults.docs;
@@ -642,11 +652,18 @@ async function extractJobsViaMonsterAPI(page) {
                 jobArray = data.results;
             }
 
+            // Log available keys for debugging if no jobs found
+            if (!jobArray) {
+                const pagePropsKeys = Object.keys(data?.props?.pageProps || {}).join(', ');
+                log.debug(`No jobs found. pageProps keys: ${pagePropsKeys}`);
+            }
+
             if (jobArray && Array.isArray(jobArray) && jobArray.length > 0) {
                 log.info(`Found ${jobArray.length} jobs in embedded API data`);
 
                 for (const job of jobArray) {
-                    jobs.push(normalizeMonsterJob(job));
+                    const normalized = normalizeMonsterJob(job);
+                    if (normalized) jobs.push(normalized);
                 }
             }
         } catch (parseErr) {
@@ -1496,7 +1513,10 @@ try {
         throw new Error('maxPages must be between 0 and 30 (0 = unlimited)');
     }
 
-    const httpOnly = input.httpOnly ?? false;
+    // Monster.com has DataDome protection - browser extraction is required
+    // These are hardcoded for optimal performance, not exposed in input schema
+    const httpOnly = false;
+    const useBrowserFirst = true;
 
     const searchUrl = buildSearchUrl(input);
     log.info(`Search URL: ${searchUrl}`);
@@ -1512,9 +1532,10 @@ try {
 
     const seenJobUrls = new Set();
 
-    // Internal JSON API fast path
+    // Skip Internal API if using browser-first (DataDome blocks direct API calls)
     let internalJobsSaved = 0;
-    if (input.searchQuery) {
+    if (input.searchQuery && !useBrowserFirst) {
+        log.info('Attempting Internal API extraction...');
         const pageSize = 25;
         for (let page = 1; (maxPages === 0 || page <= maxPages) && (maxJobs === 0 || internalJobsSaved < maxJobs); page++) {
             const apiJobs = await extractJobsViaInternalApi({
@@ -1559,8 +1580,8 @@ try {
         }
     }
 
-    // HTTP-first fast path (Next.js/JSON/HTML)
-    const shouldRunHttp = maxJobs === 0 || totalJobsScraped < maxJobs;
+    // HTTP-first fast path (Next.js/JSON/HTML) - skip if using browser-first
+    const shouldRunHttp = !useBrowserFirst && (maxJobs === 0 || totalJobsScraped < maxJobs);
     const httpResult = shouldRunHttp
         ? await extractJobsHttpFirst(searchUrl, proxyConfiguration, {
             maxJobs,
@@ -1599,12 +1620,15 @@ try {
         log.info('HTTP extraction returned no jobs, will try browser fallback unless disabled.');
     }
 
-    const shouldUseBrowser = !httpOnly && totalJobsScraped === 0;
+    // Browser extraction with Camoufox (primary method for DataDome-protected sites)
+    const shouldUseBrowser = !httpOnly && (useBrowserFirst || totalJobsScraped === 0);
 
     if (httpOnly) {
-        log.info('HTTP-only mode enabled; skipping browser fallback.');
+        log.info('HTTP-only mode enabled; skipping browser.');
+    } else if (useBrowserFirst) {
+        log.info('Using browser-first mode with Camoufox for DataDome bypass...');
     } else if (!shouldUseBrowser) {
-        log.info('Skipping browser fallback because HTTP extraction succeeded.');
+        log.info('Skipping browser because HTTP extraction succeeded.');
     }
 
     if (shouldUseBrowser) {

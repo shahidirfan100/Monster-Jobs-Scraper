@@ -64,12 +64,6 @@
             "default": {
                 "useApifyProxy": true
             }
-        },
-        "httpOnly": {
-            "title": "HTTP Only (Skip Browser)",
-            "type": "boolean",
-            "description": "Use only HTTP (JSON/HTML) strategies and skip Playwright/Camoufox fallback for faster and cheaper runs.",
-            "default": false
         }
     },
     "required": []
